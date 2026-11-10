@@ -1,0 +1,29 @@
+[package]
+name = "rustca-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Keystore 解析、憑證鏈、搜尋與 TLS 交握模擬核心函式庫"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+thiserror = "2"
+x509-parser = { version = "0.18", features = ["verify"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "local-offset"] }
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+des = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+base64 = "0.22"
+hex = "0.4"
+p12-keystore = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

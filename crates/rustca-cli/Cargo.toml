@@ -1,0 +1,18 @@
+[package]
+name = "rustca-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RUST-CA 命令列工具（Windows / Linux）"
+
+[[bin]]
+name = "rust-ca"
+path = "src/main.rs"
+
+[dependencies]
+rustca-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+comfy-table = "7"
+rpassword = "7"

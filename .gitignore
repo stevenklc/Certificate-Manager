@@ -1,0 +1,27 @@
+/target
+**/*.rs.bk
+
+# 憑證庫、私鑰與密碼檔一律不進版控（避免 commit secrets）
+*.jks
+*.jceks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.crt
+*.der
+*.csr
+*.p7b
+*.srl
+*password*
+*.secret
+.env
+/testdata/
+/fixtures/
+
+# IDE
+.idea/
+.vscode/
+*.iml
