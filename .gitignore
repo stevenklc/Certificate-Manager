@@ -1,4 +1,5 @@
 /target
+/dist/
 **/*.rs.bk
 
 # 憑證庫、私鑰與密碼檔一律不進版控（避免 commit secrets）

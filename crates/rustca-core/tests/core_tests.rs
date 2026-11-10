@@ -508,3 +508,29 @@ fn remote_via_http_connect_proxy() {
     t1.join().unwrap();
     drop(t2);
 }
+
+#[test]
+fn windows_proxy_settings_parsing() {
+    assert_eq!(
+        tls::parse_proxy_server("proxy.corp:8080").as_deref(),
+        Some("http://proxy.corp:8080")
+    );
+    assert_eq!(
+        tls::parse_proxy_server("http=p1:80;https=p2:443;ftp=p3:21").as_deref(),
+        Some("http://p2:443")
+    );
+    assert_eq!(
+        tls::parse_proxy_server("ftp=p3:21;http=p1:80").as_deref(),
+        Some("http://p1:80")
+    );
+    assert_eq!(tls::parse_proxy_server(""), None);
+
+    let ov = "*.corp.example;10.*;Fileserver;build*.dev.example;<local>";
+    assert!(tls::windows_bypass_match("api.corp.example", ov));
+    assert!(tls::windows_bypass_match("10.1.2.3", ov));
+    assert!(tls::windows_bypass_match("FILESERVER", ov));
+    assert!(tls::windows_bypass_match("build01.dev.example", ov));
+    assert!(tls::windows_bypass_match("intranet", ov)); // <local>
+    assert!(!tls::windows_bypass_match("www.google.com", ov));
+    assert!(!tls::windows_bypass_match("corp.example.evil.com", ov));
+}

@@ -197,10 +197,10 @@ enum HandshakeCmd {
         /// 逾時秒數
         #[arg(long, default_value_t = 10)]
         timeout: u64,
-        /// HTTP CONNECT proxy，例如 http://user:pass@proxy:8080（未指定時讀取 HTTPS_PROXY / NO_PROXY）
+        /// HTTP CONNECT proxy，例如 http://user:pass@proxy:8080（未指定時依序讀取 HTTPS_PROXY / NO_PROXY、Windows 系統 proxy 設定）
         #[arg(long)]
         proxy: Option<String>,
-        /// 不使用任何 proxy（忽略 HTTPS_PROXY）
+        /// 不使用任何 proxy（忽略 HTTPS_PROXY 與系統設定）
         #[arg(long, conflicts_with = "proxy")]
         no_proxy: bool,
         #[command(flatten)]
@@ -402,12 +402,18 @@ fn handshake(cmd: HandshakeCmd, out: &Out) -> Result<u8> {
         } => {
             let proxy = if no_proxy {
                 None
+            } else if proxy.is_some() {
+                proxy
             } else {
-                proxy.or_else(|| {
-                    tls::split_host_port(&address)
-                        .ok()
-                        .and_then(|(h, _)| tls::proxy_from_env(&h))
-                })
+                tls::split_host_port(&address)
+                    .ok()
+                    .and_then(|(h, _)| tls::auto_proxy(&h))
+                    .map(|(p, source)| {
+                        if !out.json {
+                            out.info(&format!("使用 {source}中的 proxy"));
+                        }
+                        p
+                    })
             };
             let trust_mode = if insecure {
                 RemoteTrust::Insecure

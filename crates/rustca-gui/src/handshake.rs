@@ -268,7 +268,8 @@ impl HandshakeState {
         } else if self.use_env_proxy {
             tls::split_host_port(&address)
                 .ok()
-                .and_then(|(h, _)| tls::proxy_from_env(&h))
+                .and_then(|(h, _)| tls::auto_proxy(&h))
+                .map(|(p, _)| p)
         } else {
             None
         };
@@ -418,7 +419,10 @@ impl HandshakeState {
                                             .password(hide)
                                             .desired_width(260.0),
                                     );
-                                    ui.checkbox(&mut self.use_env_proxy, "未填時使用 HTTPS_PROXY");
+                                    ui.checkbox(
+                                        &mut self.use_env_proxy,
+                                        "未填時使用系統 proxy 設定",
+                                    );
                                 });
                                 ui.end_row();
                                 ui.label(RichText::new("逾時").strong());

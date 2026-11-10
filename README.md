@@ -22,7 +22,7 @@
   - 可指定 TLS 1.2／1.3、SNI，以及「模擬時間」（例如檢查憑證到期後還能不能交握）
   - 逐筆列出交握訊息（ClientHello、Certificate、Alert…）
   - 失敗時以中文說明原因與建議，例如缺根 CA、主機名稱不符 SAN、EKU 不符、Client 憑證不被信任、企業 proxy 進行 TLS 檢查
-  - 支援 HTTP CONNECT proxy（含帳密），也會讀取 `HTTPS_PROXY` / `NO_PROXY`
+  - 支援 HTTP CONNECT proxy（含帳密），自動讀取 `HTTPS_PROXY` / `NO_PROXY` 與 Windows 系統 proxy 設定
 
 ## 建置
 
@@ -41,6 +41,20 @@ cargo build --release -p rustca-cli
 ```
 
 > GUI 以 Windows 為目標。在 Linux 上也能編譯（X11 / Wayland），方便開發時檢查。
+
+### 在 Linux / WSL 交叉編譯 Windows 版（不需要 Visual Studio、不需要管理員權限）
+
+```bash
+# 一次性準備：下載 llvm-mingw 解壓到 ~/.local/opt，並加入 Rust 的 Windows 目標
+mkdir -p ~/.local/opt && cd ~/.local/opt
+curl -sSfL https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64.tar.xz | tar xJ
+rustup target add x86_64-pc-windows-gnullvm
+
+# 編譯，產出 dist/windows/rust-ca.exe、rust-ca-gui.exe
+scripts/build-windows.sh
+```
+
+產出的 exe 只依賴 Windows 10 以上內建的系統 DLL（含 UCRT），複製過去就能執行。
 
 ## CLI 使用方式
 
@@ -131,4 +145,4 @@ scripts/         產生測試用憑證庫的腳本
 - JCEKS 的秘密金鑰（SecretKey）條目是 Java 序列化物件，遇到時只會顯示該條目，後面的條目無法繼續解析
 - PEM 加密私鑰（`ENCRYPTED PRIVATE KEY`）尚不支援，請先用 openssl 解密
 - TLS 模擬使用 rustls，只支援 TLS 1.2／1.3。它比 Java／OpenSSL 嚴格，例如不接受 SHA-1 簽章，也不接受 Java 8 keytool 產生的帶 NULL 參數的 ECDSA 憑證。遇到這類情況，診斷訊息會特別說明
-- proxy 只支援 HTTP CONNECT（Basic 認證），不支援 NTLM / Kerberos
+- proxy 只支援 HTTP CONNECT（Basic 認證），不支援 NTLM / Kerberos。沒有指定 `--proxy` 時，會依序使用 `HTTPS_PROXY` / `NO_PROXY`、Windows 系統 proxy 設定（含 ProxyOverride 例外清單）

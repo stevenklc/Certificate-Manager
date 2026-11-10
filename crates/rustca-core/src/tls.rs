@@ -1034,6 +1034,196 @@ impl ProxyConfig {
     }
 }
 
+/// 自動決定 proxy：HTTPS_PROXY 環境變數優先，其次是 Windows 系統 proxy 設定。
+/// 回傳 (proxy URL, 來源說明)。
+pub fn auto_proxy(target_host: &str) -> Option<(String, &'static str)> {
+    if std::env::var("https_proxy")
+        .or_else(|_| std::env::var("HTTPS_PROXY"))
+        .is_ok_and(|v| !v.trim().is_empty())
+    {
+        return proxy_from_env(target_host).map(|p| (p, "HTTPS_PROXY 環境變數"));
+    }
+    windows_system_proxy(target_host).map(|p| (p, "Windows 系統 proxy 設定"))
+}
+
+/// 讀取 Windows「網際網路選項」的 proxy 設定（HKCU\...\Internet Settings）。非 Windows 平台回傳 None。
+pub fn windows_system_proxy(target_host: &str) -> Option<String> {
+    let (enabled, server, overrides) = winreg::read_proxy_settings()?;
+    if !enabled {
+        return None;
+    }
+    let proxy = parse_proxy_server(&server)?;
+    if windows_bypass_match(target_host, &overrides) {
+        return None;
+    }
+    Some(proxy)
+}
+
+/// 解析 ProxyServer：「host:port」或「http=host:port;https=host:port;…」。
+pub fn parse_proxy_server(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let pick = if s.contains('=') {
+        let map: Vec<(String, String)> = s
+            .split(';')
+            .filter_map(|p| p.split_once('='))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        ["https", "http"]
+            .iter()
+            .find_map(|k| map.iter().find(|(mk, _)| mk == k).map(|(_, v)| v.clone()))?
+    } else {
+        s.to_string()
+    };
+    let pick = pick.trim_start_matches("http://").to_string();
+    (!pick.is_empty()).then(|| format!("http://{pick}"))
+}
+
+/// 判斷主機是否符合 Windows ProxyOverride（以 ; 分隔，支援 * 萬用字元與 <local>）。
+pub fn windows_bypass_match(host: &str, overrides: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    overrides
+        .split(';')
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty())
+        .any(|rule| {
+            if rule == "<local>" {
+                !h.contains('.') && !h.contains(':')
+            } else {
+                glob_match(&rule, &h)
+            }
+        })
+}
+
+/// 只支援 * 的萬用字元比對。
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti, mut star, mut mark) = (0usize, 0usize, None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] != '*' && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+#[cfg(windows)]
+mod winreg {
+    use std::ffi::c_void;
+
+    type Hkey = isize;
+    // HKEY_CURRENT_USER = (HKEY)(LONG)0x80000001，在 64 位元下為符號延伸
+    const HKCU: Hkey = 0x8000_0001u32 as i32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: Hkey,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            ty: *mut u32,
+            data: *mut c_void,
+            len: *mut u32,
+        ) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+    fn read_dword(name: &str) -> Option<u32> {
+        let (k, v) = (wide(KEY), wide(name));
+        let mut data = 0u32;
+        let mut len = 4u32;
+        // SAFETY: 緩衝區大小正確，字串以 NUL 結尾。
+        let rc = unsafe {
+            RegGetValueW(
+                HKCU,
+                k.as_ptr(),
+                v.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                &mut data as *mut u32 as *mut c_void,
+                &mut len,
+            )
+        };
+        (rc == 0).then_some(data)
+    }
+
+    fn read_sz(name: &str) -> Option<String> {
+        let (k, v) = (wide(KEY), wide(name));
+        let mut len = 0u32;
+        // SAFETY: 第一次呼叫只查詢所需長度。
+        let rc = unsafe {
+            RegGetValueW(
+                HKCU,
+                k.as_ptr(),
+                v.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        if rc != 0 || len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; (len as usize).div_ceil(2)];
+        // SAFETY: buf 大小等於上一步回報的位元組數。
+        let rc = unsafe {
+            RegGetValueW(
+                HKCU,
+                k.as_ptr(),
+                v.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..end]))
+    }
+
+    pub fn read_proxy_settings() -> Option<(bool, String, String)> {
+        let enabled = read_dword("ProxyEnable").unwrap_or(0) != 0;
+        let server = read_sz("ProxyServer").unwrap_or_default();
+        let overrides = read_sz("ProxyOverride").unwrap_or_default();
+        Some((enabled, server, overrides))
+    }
+}
+
+#[cfg(not(windows))]
+mod winreg {
+    pub fn read_proxy_settings() -> Option<(bool, String, String)> {
+        None
+    }
+}
+
 /// 依 HTTPS_PROXY / NO_PROXY 環境變數決定要不要使用 proxy。
 pub fn proxy_from_env(target_host: &str) -> Option<String> {
     let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
@@ -1385,8 +1575,12 @@ pub fn explain(err: &rustls::Error, side: Side) -> String {
         E::General(s) if s.contains("關閉") || s.contains("reset") || s.contains("forcibly") => {
             "連線被對方中斷。若 Server 啟用 mTLS，可能是 Client 憑證被拒絕（TLS 1.3 下 Server 可能在 Client 送完憑證後才中斷）。".into()
         }
-        E::General(s) if s.contains("timed out") || s.contains("逾時") || s.contains("WouldBlock") || s.contains("Resource temporarily unavailable") => {
-            "連線逾時，請確認網路與防火牆設定。".into()
+        E::General(s)
+            if ["timed out", "逾時", "WouldBlock", "Resource temporarily unavailable", "os error 10060", "os error 110)"]
+                .iter()
+                .any(|k| s.contains(k)) =>
+        {
+            "連線逾時：對方沒有回應。企業內網常會擋掉直接連外，請改用 proxy（--proxy、HTTPS_PROXY 或 Windows 系統 proxy 設定），或確認防火牆規則。".into()
         }
         _ => String::new(),
     }
