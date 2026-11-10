@@ -47,12 +47,45 @@ impl Out {
         t
     }
 
-    fn print_json(&self, v: &Value) {
+    pub fn print_json(&self, v: &Value) {
         println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
     }
 
     pub fn error(&self, msg: &str) {
         eprintln!("{} {msg}", self.paint("錯誤：", RED));
+    }
+
+    pub fn success(&self, msg: &str) {
+        println!("{}", self.paint(&format!("✔ {msg}"), GREEN));
+    }
+
+    /// 一行結果（stdout）：Some(true) 綠、Some(false) 紅、None 一般。
+    pub fn line(&self, ok: Option<bool>, msg: &str) {
+        match ok {
+            Some(true) => println!("{}", self.paint(msg, GREEN)),
+            Some(false) => println!("{}", self.paint(msg, RED)),
+            None => println!("{msg}"),
+        }
+    }
+
+    /// 憑證鏈驗證結果。
+    pub fn verification(&self, v: &rustca_core::edit::Verification) {
+        use rustca_core::edit::CheckLevel;
+        println!("{}", self.paint(&format!("── 驗證「{}」──", v.alias), CYAN));
+        for c in &v.checks {
+            match c.level {
+                CheckLevel::Ok => println!("  {}", self.paint(&format!("✔ {}", c.message), GREEN)),
+                CheckLevel::Warn => {
+                    println!("  {}", self.paint(&format!("⚠ {}", c.message), YELLOW))
+                }
+                CheckLevel::Error => println!("  {}", self.paint(&format!("✘ {}", c.message), RED)),
+            }
+        }
+        if v.ok {
+            println!("{}", self.paint("驗證通過", GREEN));
+        } else {
+            println!("{}", self.paint("驗證失敗", RED));
+        }
     }
 
     pub fn warn(&self, msg: &str) {
@@ -460,6 +493,44 @@ impl Out {
         }
         for w in &r.warnings {
             println!("{}", self.paint(&format!("⚠ {w}"), YELLOW));
+        }
+
+        if let Some(h) = &r.http {
+            println!("\n{}", self.paint("── HTTP 請求 ──", CYAN));
+            println!("  {}", self.paint(&format!("> {}", h.request_line), BOLD));
+            for (k, v) in &h.request_headers {
+                println!("  {}", self.paint(&format!("> {k}: {v}"), DIM));
+            }
+            if let Some(e) = &h.error {
+                println!("  {}", self.paint(&format!("✘ {e}"), RED));
+            }
+            if !h.status_line.is_empty() {
+                let code = match h.status {
+                    Some(c) if c < 300 => GREEN,
+                    Some(c) if c < 400 => CYAN,
+                    Some(c) if c < 500 => YELLOW,
+                    _ => RED,
+                };
+                println!(
+                    "  {}  {}",
+                    self.paint(&format!("< {}", h.status_line), code),
+                    self.paint(&format!("({} ms)", h.elapsed_ms), DIM)
+                );
+                for (k, v) in &h.headers {
+                    println!("  {}", self.paint(&format!("< {k}: {v}"), DIM));
+                }
+                println!();
+                for line in h.body_preview.lines().take(40) {
+                    println!("  {line}");
+                }
+                let shown = h.body_preview.lines().count();
+                if h.truncated || shown > 40 {
+                    println!(
+                        "  {}",
+                        self.paint(&format!("…（共 {} bytes，僅顯示部分）", h.body_bytes), DIM)
+                    );
+                }
+            }
         }
 
         println!();

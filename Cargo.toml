@@ -17,3 +17,9 @@ serde_json = "1"
 lto = true
 codegen-units = 1
 strip = true
+
+# RSA 金鑰產生在 debug 模式非常慢，相關套件一律最佳化
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3

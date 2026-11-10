@@ -121,6 +121,17 @@ pub fn oid_from_string(s: &str) -> Vec<u8> {
     out
 }
 
+/// 非負整數的 DER INTEGER 內容（最短表示，必要時補 0x00）。
+pub fn uint_bytes(v: u64) -> Vec<u8> {
+    let b = v.to_be_bytes();
+    let skip = b.iter().take_while(|x| **x == 0).count().min(7);
+    let mut out = b[skip..].to_vec();
+    if out[0] & 0x80 != 0 {
+        out.insert(0, 0);
+    }
+    out
+}
+
 /// 編碼一個 TLV。
 pub fn encode(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];

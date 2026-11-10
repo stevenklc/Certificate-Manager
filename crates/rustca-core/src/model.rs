@@ -97,6 +97,25 @@ impl Serialize for KeyState {
     }
 }
 
+/// 密碼字串：Debug / Display 一律遮蔽，避免誤印到 log。
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: impl Into<String>) -> Self {
+        Secret(s.into())
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("***")
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Entry {
     pub alias: String,
@@ -107,6 +126,12 @@ pub struct Entry {
     pub chain: Vec<CertInfo>,
     pub key: KeyState,
     pub note: Option<String>,
+    /// JKS / JCEKS 原始的 EncryptedPrivateKeyInfo，私鑰未解密時仍可原樣寫回
+    #[serde(skip)]
+    pub protected: Option<Vec<u8>>,
+    /// 此條目的私鑰密碼（寫回 JKS / JCEKS 時使用，None 表示與憑證庫密碼相同）
+    #[serde(skip)]
+    pub key_password: Option<Secret>,
 }
 
 impl Entry {
@@ -142,6 +167,9 @@ pub struct Keystore {
     pub integrity: Integrity,
     pub entries: Vec<Entry>,
     pub warnings: Vec<String>,
+    /// 開啟時使用（且驗證過）的憑證庫密碼，儲存時使用
+    #[serde(skip)]
+    pub store_password: Option<Secret>,
 }
 
 impl Keystore {

@@ -1,12 +1,15 @@
 //! 開發用：自動截圖（僅 debug build）。
 //! RUST_CA_SCREENSHOT=out.png       截圖輸出路徑
 //! RUST_CA_SCREENSHOT_TAB=handshake 切到交握分頁並執行本機模擬
+//!   gen / java / convert：開啟「製作憑證鏈」/「Java 相容性測試」/「轉換憑證格式」
 
 use eframe::egui;
 
 pub struct DevShot {
     pub path: std::path::PathBuf,
     pub tab: String,
+    /// 為 true 時暫緩截圖（等待背景工作）
+    pub hold: bool,
     frames: u32,
     requested: bool,
 }
@@ -20,6 +23,7 @@ impl DevShot {
         Some(DevShot {
             path: path.into(),
             tab: std::env::var("RUST_CA_SCREENSHOT_TAB").unwrap_or_default(),
+            hold: false,
             frames: 0,
             requested: false,
         })
@@ -29,6 +33,9 @@ impl DevShot {
     pub fn tick(&mut self, ctx: &egui::Context) -> bool {
         self.frames += 1;
         ctx.request_repaint();
+        if self.hold {
+            self.frames = 0;
+        }
         if !self.requested && self.frames > 40 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             self.requested = true;

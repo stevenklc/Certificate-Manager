@@ -7,7 +7,10 @@
 pub mod cert;
 pub mod chain;
 pub mod der;
+pub mod edit;
 pub mod error;
+pub mod forge;
+pub mod javacompat;
 pub mod jks;
 pub mod loader;
 pub mod model;
@@ -19,5 +22,5 @@ pub use cert::{format_ts, init_local_offset, now_ts, parse_date, CertInfo, Valid
 pub use chain::{build_chain, BuiltChain, ChainEnd, ChainLink};
 pub use error::{Error, Result};
 pub use loader::{detect_format, load_bytes, load_file, LoadOptions};
-pub use model::{Entry, EntryKind, Integrity, KeyState, Keystore, StoreFormat};
+pub use model::{Entry, EntryKind, Integrity, KeyFormat, KeyState, Keystore, Secret, StoreFormat};
 pub use search::{search, Matcher, SearchHit};

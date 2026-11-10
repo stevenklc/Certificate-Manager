@@ -6,7 +6,9 @@ use crate::cert::CertInfo;
 use crate::der;
 use crate::error::{Error, Result};
 use crate::jks;
-use crate::model::{Entry, EntryKind, Integrity, KeyFormat, KeyState, Keystore, StoreFormat};
+use crate::model::{
+    Entry, EntryKind, Integrity, KeyFormat, KeyState, Keystore, Secret, StoreFormat,
+};
 use crate::pem;
 
 const OID_PKCS7_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
@@ -93,12 +95,17 @@ pub fn load_bytes(path: PathBuf, data: &[u8], opts: &LoadOptions) -> Result<Keys
         }
     };
 
+    let store_password = match integrity {
+        Integrity::Verified => pw.map(Secret::new),
+        _ => None,
+    };
     Ok(Keystore {
         path,
         format,
         integrity,
         entries,
         warnings,
+        store_password,
     })
 }
 
@@ -110,6 +117,8 @@ fn cert_entry(alias: &str, cert: CertInfo) -> Entry {
         chain: vec![cert],
         key: KeyState::None,
         note: None,
+        protected: None,
+        key_password: None,
     }
 }
 
@@ -150,6 +159,8 @@ fn load_pkcs12(data: &[u8], password: Option<&str>) -> Result<Loaded> {
                         der: chain.key().as_der().to_vec(),
                     },
                     note: None,
+                    protected: None,
+                    key_password: None,
                 });
             }
             KeyStoreEntry::Certificate(c) => match CertInfo::from_der(c.as_der()) {
@@ -163,6 +174,8 @@ fn load_pkcs12(data: &[u8], password: Option<&str>) -> Result<Loaded> {
                 chain: vec![],
                 key: KeyState::Locked("秘密金鑰內容不顯示".into()),
                 note: Some(format!("{:?}，{} bytes", s.key_type(), s.key().len())),
+                protected: None,
+                key_password: None,
             }),
         }
     }
@@ -223,6 +236,8 @@ fn load_pem(data: &[u8]) -> Result<Loaded> {
                 chain: certs,
                 key: k,
                 note: Some("PEM 的憑證依檔案順序視為憑證鏈（終端憑證在前）".into()),
+                protected: None,
+                key_password: None,
             }]
         }
         None => certs

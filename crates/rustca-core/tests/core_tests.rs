@@ -3,7 +3,7 @@ mod common;
 use std::path::PathBuf;
 
 use common::*;
-use rustca_core::jks::{self, WriteEntry};
+use rustca_core::jks::{self, KeyBlob, WriteEntry};
 use rustca_core::tls::{self, LocalOptions, RemoteOptions, RemoteTrust, Side, TlsVersion};
 use rustca_core::*;
 
@@ -13,15 +13,20 @@ fn server_jks(p: &Pki) -> Keystore {
     let leaf = p.server.der();
     let inter = p.inter.der();
     let key = p.server.key_der();
-    let data = jks::encode(
+    let data = jks::encode_store(
+        StoreFormat::Jks,
         &[WriteEntry::PrivateKey {
             alias: "server",
-            pkcs8: &key,
+            created: None,
+            key: KeyBlob::Plain {
+                pkcs8: &key,
+                password: PW,
+            },
             chain: vec![&leaf, &inter],
         }],
         PW,
-        PW,
-    );
+    )
+    .unwrap();
     load_bytes(
         PathBuf::from("server.jks"),
         &data,
@@ -34,15 +39,20 @@ fn client_jks(p: &Pki) -> Keystore {
     let leaf = p.client.der();
     let inter = p.inter.der();
     let key = p.client.key_der();
-    let data = jks::encode(
+    let data = jks::encode_store(
+        StoreFormat::Jks,
         &[WriteEntry::PrivateKey {
             alias: "client",
-            pkcs8: &key,
+            created: None,
+            key: KeyBlob::Plain {
+                pkcs8: &key,
+                password: PW,
+            },
             chain: vec![&leaf, &inter],
         }],
         PW,
-        PW,
-    );
+    )
+    .unwrap();
     load_bytes(
         PathBuf::from("client.jks"),
         &data,
@@ -54,9 +64,13 @@ fn client_jks(p: &Pki) -> Keystore {
 fn trust_jks(certs: &[(&str, Vec<u8>)]) -> Keystore {
     let entries: Vec<_> = certs
         .iter()
-        .map(|(a, c)| WriteEntry::TrustedCert { alias: a, cert: c })
+        .map(|(a, c)| WriteEntry::TrustedCert {
+            alias: a,
+            created: None,
+            cert: c,
+        })
         .collect();
-    let data = jks::encode(&entries, PW, PW);
+    let data = jks::encode_store(StoreFormat::Jks, &entries, PW).unwrap();
     load_bytes(
         PathBuf::from("trust.jks"),
         &data,
@@ -87,15 +101,20 @@ fn jks_roundtrip_and_password() {
     // 不給密碼：可列出，但私鑰鎖住
     let leaf = p.server.der();
     let key = p.server.key_der();
-    let data = jks::encode(
+    let data = jks::encode_store(
+        StoreFormat::Jks,
         &[WriteEntry::PrivateKey {
             alias: "server",
-            pkcs8: &key,
+            created: None,
+            key: KeyBlob::Plain {
+                pkcs8: &key,
+                password: "keypass",
+            },
             chain: vec![&leaf],
         }],
         PW,
-        "keypass",
-    );
+    )
+    .unwrap();
     let ks = load_bytes("a.jks".into(), &data, &LoadOptions::default()).unwrap();
     assert_eq!(ks.integrity, Integrity::NotChecked);
     assert!(matches!(ks.entries[0].key, KeyState::Locked(_)));
@@ -362,6 +381,7 @@ fn remote_handshake_against_local_server() {
             timeout: std::time::Duration::from_secs(5),
             trust: RemoteTrust::Certs(vec![trust]),
             proxy: None,
+            http: None,
         },
         None,
     );
@@ -380,6 +400,7 @@ fn remote_handshake_against_local_server() {
             timeout: std::time::Duration::from_secs(5),
             trust: RemoteTrust::Certs(vec![other]),
             proxy: None,
+            http: None,
         },
         None,
     );
@@ -497,6 +518,7 @@ fn remote_via_http_connect_proxy() {
             timeout: std::time::Duration::from_secs(5),
             trust: RemoteTrust::Certs(vec![CertInfo::from_der(&p.root.der()).unwrap()]),
             proxy: Some(format!("http://user:p%40ss@127.0.0.1:{proxy_port}")),
+            http: None,
         },
         None,
     );

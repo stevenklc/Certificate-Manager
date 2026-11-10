@@ -1,5 +1,6 @@
 //! 交握模擬分頁。
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,7 +10,108 @@ use rustca_core::tls::{
 };
 use rustca_core::{now_ts, parse_date, CertInfo, Keystore};
 
-use crate::widgets::{status_text, BLUE, GREEN, RED, YELLOW};
+use crate::widgets::{pick_cert_files, status_text, BLUE, GREEN, RED, YELLOW};
+
+const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+/// TLS 身分選擇：憑證庫中的私鑰條目，或「憑證檔 + 私鑰檔」。
+#[derive(Default)]
+struct IdPicker {
+    pair: bool,
+    store: Option<usize>,
+    alias: Option<String>,
+    cert: Option<usize>,
+    key: Option<usize>,
+}
+
+impl IdPicker {
+    fn fix(&mut self, n: usize) {
+        for s in [&mut self.store, &mut self.cert, &mut self.key] {
+            if s.is_some_and(|i| i >= n) {
+                *s = None;
+            }
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        if self.pair {
+            self.cert.is_some() || self.key.is_some()
+        } else {
+            self.store.is_some()
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, id: &str, stores: &[Keystore], opens: &mut Vec<PathBuf>) {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.pair, false, "憑證庫（含私鑰）");
+                ui.radio_value(&mut self.pair, true, "憑證檔 + 私鑰檔");
+                if ui
+                    .small_button("📂 加入檔案…")
+                    .on_hover_text("開啟 .jks / .p12 / .cer / .pem / .key 檔案")
+                    .clicked()
+                {
+                    opens.extend(pick_cert_files());
+                }
+            });
+            ui.horizontal(|ui| {
+                if self.pair {
+                    ui.label("憑證");
+                    file_combo(ui, &format!("{id}_cert"), &mut self.cert, stores, |s| {
+                        let n = s.all_certs().len();
+                        (n > 0).then(|| format!("{}（{n} 張憑證）", s.name()))
+                    });
+                    ui.label("私鑰");
+                    file_combo(ui, &format!("{id}_key"), &mut self.key, stores, |s| {
+                        s.private_key_entries().next().map(|_| s.name())
+                    });
+                } else {
+                    store_combo(ui, id, &mut self.store, &mut self.alias, stores);
+                }
+            });
+        });
+    }
+
+    fn resolve(&self, stores: &[Keystore], what: &str) -> Result<Option<tls::Identity>, String> {
+        if !self.pair {
+            return identity(self.store, &self.alias, stores, what);
+        }
+        match (
+            self.cert.and_then(|i| stores.get(i)),
+            self.key.and_then(|i| stores.get(i)),
+        ) {
+            (None, None) => Ok(None),
+            (Some(c), Some(k)) => tls::identity_from_cert_and_key(c, k)
+                .map(Some)
+                .map_err(|e| format!("{what}：{e}")),
+            _ => Err(format!("{what}：請同時選擇憑證檔與私鑰檔")),
+        }
+    }
+}
+
+fn file_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    sel: &mut Option<usize>,
+    stores: &[Keystore],
+    label: impl Fn(&Keystore) -> Option<String>,
+) {
+    let text = sel
+        .and_then(|i| stores.get(i))
+        .map(|s| s.name())
+        .unwrap_or_else(|| "（請選擇）".into());
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .width(200.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(sel, None, "（無）");
+            for (i, s) in stores.iter().enumerate() {
+                if let Some(l) = label(s) {
+                    ui.selectable_value(sel, Some(i), l);
+                }
+            }
+        });
+}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Mode {
@@ -30,19 +132,21 @@ type Shared = Arc<Mutex<Option<HandshakeReport>>>;
 pub struct HandshakeState {
     mode: Mode,
     // 本機
-    server: Option<usize>,
-    server_alias: Option<String>,
+    server: IdPicker,
     client_trust: Vec<bool>,
     mtls: bool,
-    client: Option<usize>,
-    client_alias: Option<String>,
+    client: IdPicker,
     server_trust: Vec<bool>,
     // 遠端
     address: String,
     trust_mode: TrustMode,
     remote_trust: Vec<bool>,
-    remote_client: Option<usize>,
-    remote_client_alias: Option<String>,
+    remote_client: IdPicker,
+    http: bool,
+    method: String,
+    http_path: String,
+    headers: String,
+    body: String,
     proxy: String,
     use_env_proxy: bool,
     timeout: u64,
@@ -53,24 +157,28 @@ pub struct HandshakeState {
     running: Option<Shared>,
     result: Option<HandshakeReport>,
     error: Option<String>,
+    /// 使用者在此分頁要求開啟的檔案，由 App 取走
+    pub open_requests: Vec<PathBuf>,
 }
 
 impl Default for HandshakeState {
     fn default() -> Self {
         HandshakeState {
             mode: Mode::Local,
-            server: None,
-            server_alias: None,
+            server: IdPicker::default(),
             client_trust: vec![],
             mtls: false,
-            client: None,
-            client_alias: None,
+            client: IdPicker::default(),
             server_trust: vec![],
             address: String::new(),
             trust_mode: TrustMode::System,
             remote_trust: vec![],
-            remote_client: None,
-            remote_client_alias: None,
+            remote_client: IdPicker::default(),
+            http: false,
+            method: "GET".into(),
+            http_path: String::new(),
+            headers: String::new(),
+            body: String::new(),
             proxy: String::new(),
             use_env_proxy: true,
             timeout: 10,
@@ -80,6 +188,7 @@ impl Default for HandshakeState {
             running: None,
             result: None,
             error: None,
+            open_requests: vec![],
         }
     }
 }
@@ -125,12 +234,24 @@ fn store_combo(
     }
 }
 
-fn trust_checks(ui: &mut egui::Ui, sel: &mut Vec<bool>, stores: &[Keystore]) {
+fn trust_checks(
+    ui: &mut egui::Ui,
+    sel: &mut Vec<bool>,
+    stores: &[Keystore],
+    opens: &mut Vec<PathBuf>,
+) {
     sel.resize(stores.len(), false);
-    if stores.is_empty() {
-        ui.weak("請先在「憑證庫」分頁開啟檔案");
-    }
     ui.horizontal_wrapped(|ui| {
+        if ui
+            .small_button("📂 加入檔案…")
+            .on_hover_text("可選 .cer / .crt / .pem / .p7b / .jks / .p12")
+            .clicked()
+        {
+            opens.extend(pick_cert_files());
+        }
+        if stores.is_empty() {
+            ui.weak("尚未開啟任何檔案");
+        }
         for (i, s) in stores.iter().enumerate() {
             ui.checkbox(&mut sel[i], s.name())
                 .on_hover_text(format!("{} 張信任錨點", s.trust_anchors().len()));
@@ -165,9 +286,7 @@ fn identity(
 impl HandshakeState {
     pub fn on_stores_changed(&mut self, n: usize) {
         for s in [&mut self.server, &mut self.client, &mut self.remote_client] {
-            if s.is_some_and(|i| i >= n) {
-                *s = None;
-            }
+            s.fix(n);
         }
         self.client_trust.resize(n, false);
         self.server_trust.resize(n, false);
@@ -177,7 +296,7 @@ impl HandshakeState {
     /// 開發截圖用：以第一個檔案為 Server、其餘全部作為信任庫並執行本機模擬。
     pub fn demo(&mut self, stores: &[Keystore]) {
         self.on_stores_changed(stores.len());
-        self.server = Some(0);
+        self.server.store = Some(0);
         for (i, t) in self.client_trust.iter_mut().enumerate() {
             *t = i > 0;
         }
@@ -211,10 +330,12 @@ impl HandshakeState {
     }
 
     fn run_local(&mut self, stores: &[Keystore]) -> Result<HandshakeReport, String> {
-        let server = identity(self.server, &self.server_alias, stores, "Server")?
-            .ok_or("請選擇 Server 憑證庫（需含私鑰）")?;
+        let server = self
+            .server
+            .resolve(stores, "Server")?
+            .ok_or("請選擇 Server 身分（憑證庫或憑證 + 私鑰）")?;
         let client = if self.mtls {
-            identity(self.client, &self.client_alias, stores, "Client")?
+            self.client.resolve(stores, "Client")?
         } else {
             None
         };
@@ -243,8 +364,34 @@ impl HandshakeState {
     fn start_remote(&mut self, stores: &[Keystore], ctx: &egui::Context) -> Result<(), String> {
         let address = self.address.trim().to_string();
         if address.is_empty() {
-            return Err("請輸入主機，例如 www.example.com:443".into());
+            return Err("請輸入網域（www.example.com:443）或 API 網址（https://host/api）".into());
         }
+        let target = tls::parse_target(&address)?;
+        let http = if self.http || target.path.is_some() {
+            let path = match self.http_path.trim() {
+                "" => target.path.clone().unwrap_or_else(|| "/".into()),
+                p if p.starts_with('/') => p.to_string(),
+                p => format!("/{p}"),
+            };
+            let headers = self
+                .headers
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(tls::parse_header)
+                .collect::<Result<Vec<_>, _>>()?;
+            let method = match self.method.trim() {
+                "" => "GET".to_string(),
+                m => m.to_ascii_uppercase(),
+            };
+            Some(tls::HttpRequest {
+                method,
+                path,
+                headers,
+                body: self.body.as_bytes().to_vec(),
+            })
+        } else {
+            None
+        };
         let trust = match self.trust_mode {
             TrustMode::System => RemoteTrust::System,
             TrustMode::Mozilla => RemoteTrust::Mozilla,
@@ -257,19 +404,11 @@ impl HandshakeState {
                 RemoteTrust::Certs(a)
             }
         };
-        let client = identity(
-            self.remote_client,
-            &self.remote_client_alias,
-            stores,
-            "Client",
-        )?;
+        let client = self.remote_client.resolve(stores, "Client")?;
         let proxy = if !self.proxy.trim().is_empty() {
             Some(self.proxy.trim().to_string())
         } else if self.use_env_proxy {
-            tls::split_host_port(&address)
-                .ok()
-                .and_then(|(h, _)| tls::auto_proxy(&h))
-                .map(|(p, _)| p)
+            tls::auto_proxy(&target.host).map(|(p, _)| p)
         } else {
             None
         };
@@ -281,6 +420,7 @@ impl HandshakeState {
             timeout: Duration::from_secs(self.timeout.max(1)),
             trust,
             proxy,
+            http,
         };
         let shared: Shared = Arc::new(Mutex::new(None));
         let out = shared.clone();
@@ -295,6 +435,51 @@ impl HandshakeState {
         self.running = Some(shared);
         self.result = None;
         Ok(())
+    }
+
+    fn http_ui(&mut self, ui: &mut egui::Ui) {
+        let url_path = tls::parse_target(&self.address).ok().and_then(|t| t.path);
+        ui.vertical(|ui| {
+            ui.checkbox(&mut self.http, "交握成功後送出 HTTP 請求（測試 API）");
+            if !self.http && url_path.is_some() {
+                ui.weak("網址含路徑，會自動送出請求");
+            }
+            if !(self.http || url_path.is_some()) {
+                return;
+            }
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("http_method")
+                    .selected_text(self.method.clone())
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        for m in METHODS {
+                            ui.selectable_value(&mut self.method, m.to_string(), *m);
+                        }
+                    });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.http_path)
+                        .hint_text(url_path.as_deref().unwrap_or("/"))
+                        .desired_width(330.0),
+                )
+                .on_hover_text("路徑（含 query）；留空＝使用網址中的路徑");
+            });
+            ui.label("標頭（每行一個）");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.headers)
+                    .hint_text("Authorization: Bearer xxx\nContent-Type: application/json")
+                    .code_editor()
+                    .desired_rows(3)
+                    .desired_width(430.0),
+            );
+            ui.label("內容（Body）");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.body)
+                    .hint_text("{\"key\": \"value\"}")
+                    .code_editor()
+                    .desired_rows(4)
+                    .desired_width(430.0),
+            );
+        });
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, stores: &[Keystore]) {
@@ -323,51 +508,62 @@ impl HandshakeState {
                         match self.mode {
                             Mode::Local => {
                                 ui.label(RichText::new("Server 身分").strong());
-                                ui.horizontal(|ui| {
-                                    store_combo(
-                                        ui,
-                                        "srv",
-                                        &mut self.server,
-                                        &mut self.server_alias,
-                                        stores,
-                                    )
-                                });
+                                self.server.ui(ui, "srv", stores, &mut self.open_requests);
                                 ui.end_row();
                                 ui.label(RichText::new("Client 信任庫").strong());
-                                ui.vertical(|ui| trust_checks(ui, &mut self.client_trust, stores));
+                                ui.vertical(|ui| {
+                                    trust_checks(
+                                        ui,
+                                        &mut self.client_trust,
+                                        stores,
+                                        &mut self.open_requests,
+                                    )
+                                });
                                 ui.end_row();
                                 ui.label(RichText::new("雙向 TLS").strong());
                                 ui.checkbox(&mut self.mtls, "Server 要求 Client 憑證（mTLS）");
                                 ui.end_row();
                                 if self.mtls {
                                     ui.label(RichText::new("Client 身分").strong());
-                                    ui.horizontal(|ui| {
-                                        store_combo(
-                                            ui,
-                                            "cli",
-                                            &mut self.client,
-                                            &mut self.client_alias,
-                                            stores,
-                                        );
-                                        if self.client.is_none() {
+                                    ui.vertical(|ui| {
+                                        self.client.ui(ui, "cli", stores, &mut self.open_requests);
+                                        if !self.client.is_set() {
                                             ui.weak("不選＝模擬 Client 沒有憑證");
                                         }
                                     });
                                     ui.end_row();
                                     ui.label(RichText::new("Server 信任庫").strong());
                                     ui.vertical(|ui| {
-                                        trust_checks(ui, &mut self.server_trust, stores)
+                                        trust_checks(
+                                            ui,
+                                            &mut self.server_trust,
+                                            stores,
+                                            &mut self.open_requests,
+                                        )
                                     });
                                     ui.end_row();
                                 }
                             }
                             Mode::Remote => {
-                                ui.label(RichText::new("主機").strong());
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.address)
-                                        .hint_text("host:port，預設 443")
-                                        .desired_width(320.0),
-                                );
+                                ui.label(RichText::new("目標").strong());
+                                ui.vertical(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.address)
+                                            .hint_text(
+                                                "網域 www.example.com[:443] 或 API 網址 https://host/api/…",
+                                            )
+                                            .desired_width(420.0),
+                                    );
+                                    if let Err(e) = (!self.address.trim().is_empty())
+                                        .then(|| tls::parse_target(&self.address))
+                                        .transpose()
+                                    {
+                                        ui.colored_label(RED, e);
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label(RichText::new("HTTP 請求").strong());
+                                self.http_ui(ui);
                                 ui.end_row();
                                 ui.label(RichText::new("信任庫").strong());
                                 ui.vertical(|ui| {
@@ -394,20 +590,24 @@ impl HandshakeState {
                                         );
                                     });
                                     if self.trust_mode == TrustMode::Stores {
-                                        trust_checks(ui, &mut self.remote_trust, stores);
+                                        trust_checks(
+                                            ui,
+                                            &mut self.remote_trust,
+                                            stores,
+                                            &mut self.open_requests,
+                                        );
                                     }
                                 });
                                 ui.end_row();
                                 ui.label(RichText::new("Client 身分").strong());
-                                ui.horizontal(|ui| {
-                                    store_combo(
+                                ui.vertical(|ui| {
+                                    self.remote_client.ui(
                                         ui,
                                         "rcli",
-                                        &mut self.remote_client,
-                                        &mut self.remote_client_alias,
                                         stores,
+                                        &mut self.open_requests,
                                     );
-                                    ui.weak("（mTLS 時使用）");
+                                    ui.weak("（Server 要求 Client 憑證 / mTLS 時使用）");
                                 });
                                 ui.end_row();
                                 ui.label(RichText::new("Proxy").strong());
@@ -551,6 +751,9 @@ fn report_ui(ui: &mut egui::Ui, r: &HandshakeReport) {
     for w in &r.warnings {
         ui.colored_label(YELLOW, format!("⚠ {w}"));
     }
+    if let Some(h) = &r.http {
+        http_ui(ui, h);
+    }
 
     ui.add_space(6.0);
     egui::CollapsingHeader::new(RichText::new("交握訊息").strong())
@@ -602,6 +805,65 @@ fn chain_ui(ui: &mut egui::Ui, title: &str, id: &str, chain: &[CertInfo]) {
                     ui.label(status_text(c.status_at(now, 30)));
                     ui.colored_label(BLUE, format!("簽發者：{}", c.issuer));
                 });
+            }
+        });
+}
+
+fn http_ui(ui: &mut egui::Ui, h: &tls::HttpResponse) {
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(RichText::new("HTTP 請求 / 回應").strong())
+        .id_salt("http_resp")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.monospace(format!("> {}", h.request_line));
+            for (k, v) in &h.request_headers {
+                ui.weak(format!("> {k}: {v}"));
+            }
+            if let Some(e) = &h.error {
+                ui.colored_label(RED, format!("✘ {e}"));
+            }
+            if h.status_line.is_empty() {
+                return;
+            }
+            let color = match h.status {
+                Some(c) if c < 300 => GREEN,
+                Some(c) if c < 400 => BLUE,
+                Some(c) if c < 500 => YELLOW,
+                _ => RED,
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("< {}", h.status_line))
+                        .color(color)
+                        .strong(),
+                );
+                ui.weak(format!("{} ms · {} bytes", h.elapsed_ms, h.body_bytes));
+            });
+            egui::CollapsingHeader::new("回應標頭")
+                .id_salt("http_resp_headers")
+                .show(ui, |ui| {
+                    for (k, v) in &h.headers {
+                        ui.add(
+                            egui::Label::new(format!("{k}: {v}"))
+                                .wrap()
+                                .selectable(true),
+                        );
+                    }
+                });
+            let mut body = h.body_preview.clone();
+            egui::ScrollArea::vertical()
+                .id_salt("http_body")
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut body)
+                            .code_editor()
+                            .interactive(true)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            if h.truncated {
+                ui.weak(format!("…僅顯示部分內容（共 {} bytes）", h.body_bytes));
             }
         });
 }

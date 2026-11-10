@@ -1,6 +1,6 @@
 # RUST-CA
 
-用 Rust 寫的憑證庫（keystore）檢視與 TLS 交握模擬工具，分成兩個程式：
+用 Rust 寫的憑證庫（keystore）檢視、管理、製作與 TLS 交握模擬工具，分成兩個程式：
 
 | 程式 | 平台 | 用途 |
 |---|---|---|
@@ -23,6 +23,22 @@
   - 逐筆列出交握訊息（ClientHello、Certificate、Alert…）
   - 失敗時以中文說明原因與建議，例如缺根 CA、主機名稱不符 SAN、EKU 不符、Client 憑證不被信任、企業 proxy 進行 TLS 檢查
   - 支援 HTTP CONNECT proxy（含帳密），自動讀取 `HTTPS_PROXY` / `NO_PROXY` 與 Windows 系統 proxy 設定
+  - 遠端目標可以是網域（`host:port`），也可以是 API 網址（`https://host/api/...`）；交握成功後可送出 HTTP 請求（方法、標頭、Body），顯示狀態碼、回應標頭與內容，`Authorization`、Cookie 等敏感標頭會遮蔽
+  - Client / Server 身分可以用憑證庫（.jks / .p12），也可以用「憑證檔 + 私鑰檔」（.cer / .crt / .pem + .key）
+- **憑證庫管理**（JKS、JCEKS、PKCS#12）
+  - 匯入信任憑證、匯入金鑰對（來自另一個憑證庫，或憑證 + 私鑰檔）、刪除、修改別名
+  - 同一別名替換憑證 / 憑證鏈（續約、CA 回覆），**替換後自動驗證**：私鑰相符、鏈的順序與簽章、CA 屬性、有效期限、能否連到根憑證；驗證失敗不會套用
+  - 修改憑證庫密碼（store pass）與各條目的私鑰密碼（key pass）；不同條目私鑰密碼不同也能處理
+  - 儲存前自動備份（`檔名.YYYYMMDD-HHMMSS.bak`），先寫暫存檔再改名，避免寫到一半損毀
+  - 寫出的檔案經 Java keytool 驗證可正常讀取
+- **格式轉換**
+  - 憑證庫：JKS ⇄ JCEKS ⇄ PKCS#12，也能把 PEM 憑證 + 私鑰轉成憑證庫；PKCS#12 可選「舊版相容」演算法（3DES + HmacSHA1）給舊版 Java
+  - 憑證：PEM ⇄ DER（.cer）⇄ PKCS#7（.p7b），可從憑證庫取出憑證鏈或私鑰
+- **製作憑證庫與憑證鏈**
+  - 建立新的空白憑證庫
+  - 一次產生「根 CA → 中繼 CA（可多層）→ Server / Client 憑證」，金鑰可選 RSA 2048/3072/4096、EC P-256/P-384，可設定 SAN、有效天數、O / OU / C
+  - 可保存 CA 私鑰，之後再用憑證庫中的 CA 簽發新的憑證
+- **Java 相容性測試**：自動找出本機安裝的各版本 JDK / JRE（JAVA_HOME、PATH、常見安裝目錄、`~/.jdks`，也可手動加入目錄），用每個版本的 keytool 實際讀取憑證庫並解開每把私鑰，並提示已知的版本限制（例如 PKCS#12 AES 需 Java 8u301+、EdDSA 需 Java 15+）
 
 ## 建置
 
@@ -90,8 +106,52 @@ rust-ca handshake remote api.internal:8443 -t truststore.jks --client client.p12
 rust-ca handshake remote www.example.com --insecure      # 不驗證，只看憑證鏈
 rust-ca handshake remote www.example.com --proxy http://proxy:8080
 
+# 測試 API：網址含路徑時，交握後自動送出 HTTP 請求
+rust-ca handshake remote https://api.internal:8443/health -t truststore.jks
+rust-ca handshake remote https://api.internal/v1/orders -t ca.pem \
+    --client-cert client.crt --client-key client.key \
+    -X POST -H "Authorization: Bearer xxx" -H "Content-Type: application/json" -d '{"id":1}'
+
 # 所有指令都支援 --json
 rust-ca --json list server.jks
+```
+
+### 憑證庫管理（`rust-ca manage`，簡寫 `m`）
+
+修改類指令預設寫回原檔並建立 `.bak` 備份；加 `-o 新檔` 另存（格式依副檔名），`--no-backup` 不備份。新密碼可用 `--new-password` 或環境變數 `RUST_CA_NEW_PASSWORD`，未指定時會提示輸入兩次。
+
+```bash
+# 匯入 / 刪除 / 改名
+rust-ca manage import-cert truststore.jks -f partner-ca.cer -a partner-ca --create
+rust-ca manage import-key server.jks --cert server.crt --key server.key -a server
+rust-ca manage import-key server.jks --from old.p12 --from-alias 1 -a server
+rust-ca manage delete server.jks -a old-server
+rust-ca manage rename server.jks -a server -n server-2026
+
+# 替換憑證鏈（續約 / CA 回覆）：替換後自動驗證，失敗不寫入
+rust-ca manage replace-chain server.jks -a server -f renewed-chain.p7b
+rust-ca manage verify server.jks                     # 單獨驗證所有私鑰條目
+
+# 修改密碼
+rust-ca manage passwd server.jks                     # store pass（相同密碼的私鑰一併修改）
+rust-ca manage passwd server.jks --keep-key-passwords # 同 keytool -storepasswd
+rust-ca manage keypasswd server.jks -a server        # key pass
+
+# 格式轉換
+rust-ca manage convert server.jks -o server.p12                 # 憑證庫格式
+rust-ca manage convert server.jks -o server-old.p12 --legacy-p12 # 給舊版 Java
+rust-ca manage convert server.pem -o server.jks                 # PEM 憑證 + 私鑰 → JKS
+rust-ca manage convert-cert server.jks -a server -o chain.p7b   # 憑證格式
+rust-ca manage convert-cert chain.p7b -o chain.pem
+rust-ca manage convert-cert chain.pem -o leaf.cer                # DER（單張）
+
+# 製作憑證鏈
+rust-ca manage gen-chain ca.jks --create --root-cn "My Root CA" --inter-cn "My Issuing CA" -O "My Co" -C TW
+rust-ca manage gen-chain ca.jks --issuer my-issuing-ca --cn api.example.com --san api.example.com --san 10.0.0.5
+rust-ca manage gen-chain app.p12 --create --cn client01 --profile client --key ec256
+
+# Java 相容性測試（可用 --java 加入其他 JDK 目錄）
+rust-ca manage java-test server.jks --java "C:\jdks"
 ```
 
 `handshake local` 的各個憑證庫可以分別用 `--server-password`、`--client-password`、`--client-trust-password`、`--server-trust-password` 指定密碼（也有對應的環境變數，例如 `RUST_CA_SERVER_PASSWORD`）。
@@ -109,7 +169,9 @@ rust-ca --json list server.jks
 
 1. 執行 `rust-ca-gui.exe`，把檔案拖進視窗，或按「📂 開啟檔案…」。需要密碼時會跳出輸入框。
 2. **憑證庫**分頁：左側是已開啟的檔案，中間是條目表格，上方搜尋框可以即時篩選（選「全部檔案」就跨所有檔案搜尋）。點選條目後，下方會顯示憑證鏈和憑證內容，也可以複製 PEM。
-3. **交握模擬**分頁：從已開啟的檔案中挑選 Server／Client 身分和信任庫，按「▶ 開始交握」。
+3. **管理**：選取檔案或條目後，表格上方會出現管理工具列——匯入憑證、匯入金鑰對、改憑證庫密碼、儲存、另存新檔 / 轉換、製作憑證鏈、Java 相容性測試；選取條目時另有改名、替換憑證鏈、改私鑰密碼、驗證憑證鏈、匯出、刪除。修改後檔案旁會顯示「● 未儲存」，關閉前會提醒。
+4. **🆕 新增憑證庫**、**🔁 轉換憑證格式**：在上方工具列。
+5. **交握模擬**分頁：從已開啟的檔案中挑選 Server／Client 身分（憑證庫，或憑證檔 + 私鑰檔）和信任庫，按「▶ 開始交握」；每個欄位旁的「📂 加入檔案…」可直接開檔。遠端模式可輸入網域或 API 網址，並設定 HTTP 方法、標頭與 Body。
 
 ## 測試
 
@@ -144,5 +206,8 @@ scripts/         產生測試用憑證庫的腳本
 
 - JCEKS 的秘密金鑰（SecretKey）條目是 Java 序列化物件，遇到時只會顯示該條目，後面的條目無法繼續解析
 - PEM 加密私鑰（`ENCRYPTED PRIVATE KEY`）尚不支援，請先用 openssl 解密
+- 寫入 JKS / JCEKS 時別名會轉成小寫（與 keytool 相同）；含 SecretKey 條目的 JCEKS 無法寫回
+- 用既有 CA 簽發時，CA 主體不可含重複的屬性型別（例如兩個 OU）
+- Java 相容性測試需要本機已安裝 Java；只會測試找得到的版本
 - TLS 模擬使用 rustls，只支援 TLS 1.2／1.3。它比 Java／OpenSSL 嚴格，例如不接受 SHA-1 簽章，也不接受 Java 8 keytool 產生的帶 NULL 參數的 ECDSA 憑證。遇到這類情況，診斷訊息會特別說明
 - proxy 只支援 HTTP CONNECT（Basic 認證），不支援 NTLM / Kerberos。沒有指定 `--proxy` 時，會依序使用 `HTTPS_PROXY` / `NO_PROXY`、Windows 系統 proxy 設定（含 ProxyOverride 例外清單）

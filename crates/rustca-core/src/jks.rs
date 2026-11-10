@@ -18,7 +18,7 @@ use sha1::{Digest, Sha1};
 use crate::cert::CertInfo;
 use crate::der;
 use crate::error::{Error, Result};
-use crate::model::{Entry, EntryKind, Integrity, KeyFormat, KeyState, StoreFormat};
+use crate::model::{Entry, EntryKind, Integrity, KeyFormat, KeyState, Secret, StoreFormat};
 
 pub const JKS_MAGIC: u32 = 0xFEED_FEED;
 pub const JCEKS_MAGIC: u32 = 0xCECE_CECE;
@@ -172,6 +172,12 @@ pub fn parse(data: &[u8], password: Option<&str>, key_password: Option<&str>) ->
                         Err(e) => KeyState::Locked(e.to_string()),
                     },
                 };
+                let key_password = match (&key, key_password) {
+                    (KeyState::Decrypted { .. }, Some(k)) if Some(k) != password => {
+                        Some(Secret::new(k))
+                    }
+                    _ => None,
+                };
                 entries.push(Entry {
                     alias,
                     kind: EntryKind::PrivateKey,
@@ -179,6 +185,8 @@ pub fn parse(data: &[u8], password: Option<&str>, key_password: Option<&str>) ->
                     chain,
                     key,
                     note: None,
+                    protected: Some(enc.to_vec()),
+                    key_password,
                 });
             }
             2 => {
@@ -190,6 +198,8 @@ pub fn parse(data: &[u8], password: Option<&str>, key_password: Option<&str>) ->
                     chain: vec![cert],
                     key: KeyState::None,
                     note: None,
+                    protected: None,
+                    key_password: None,
                 });
             }
             3 if format == StoreFormat::Jceks => {
@@ -201,6 +211,8 @@ pub fn parse(data: &[u8], password: Option<&str>, key_password: Option<&str>) ->
                     chain: vec![],
                     key: KeyState::Locked("秘密金鑰內容不解析".into()),
                     note: Some("JCEKS 秘密金鑰條目".into()),
+                    protected: None,
+                    key_password: None,
                 });
                 if entries.len() < count as usize {
                     warnings.push(format!(
@@ -294,8 +306,165 @@ fn jceks_unprotect(data: &[u8], params: &[u8], password: &str) -> Result<Vec<u8>
     }
     let mut s = [0u8; 8];
     s.copy_from_slice(salt.content);
+    let derived = jceks_derive(password, &s, iterations);
+    let dec = cbc::Decryptor::<des::TdesEde3>::new_from_slices(&derived[..24], &derived[24..])
+        .map_err(|e| Error::Other(format!("3DES 初始化失敗：{e}")))?;
+    let plain = dec
+        .decrypt_padded_vec_mut::<Pkcs7>(data)
+        .map_err(|_| Error::WrongPassword("私鑰密碼錯誤".into()))?;
+    // 驗證結果是 DER SEQUENCE
+    match der::expect(&plain, der::TAG_SEQUENCE) {
+        Ok((t, rest)) if rest.is_empty() && !t.content.is_empty() => Ok(plain),
+        _ => Err(Error::WrongPassword("私鑰密碼錯誤".into())),
+    }
+}
+
+/// 私鑰資料：明文 PKCS#8（寫入時以指定密碼加密），或沿用既有的加密資料。
+pub enum KeyBlob<'a> {
+    Plain { pkcs8: &'a [u8], password: &'a str },
+    Protected(&'a [u8]),
+}
+
+/// 要寫入 JKS / JCEKS 的條目。
+pub enum WriteEntry<'a> {
+    PrivateKey {
+        alias: &'a str,
+        created: Option<i64>,
+        key: KeyBlob<'a>,
+        chain: Vec<&'a [u8]>,
+    },
+    TrustedCert {
+        alias: &'a str,
+        created: Option<i64>,
+        cert: &'a [u8],
+    },
+}
+
+/// 加密私鑰資料使用的演算法 OID。
+pub fn protected_key_algorithm(epki: &[u8]) -> Option<String> {
+    let (seq, _) = der::expect(epki, der::TAG_SEQUENCE).ok()?;
+    let (alg, _) = der::expect(seq.content, der::TAG_SEQUENCE).ok()?;
+    let (oid, _) = der::expect(alg.content, der::TAG_OID).ok()?;
+    Some(der::oid_to_string(oid.content))
+}
+
+/// 編碼成 JKS 或 JCEKS（version 2）。
+pub fn encode_store(
+    format: StoreFormat,
+    entries: &[WriteEntry],
+    store_password: &str,
+) -> Result<Vec<u8>> {
+    let magic = match format {
+        StoreFormat::Jks => JKS_MAGIC,
+        StoreFormat::Jceks => JCEKS_MAGIC,
+        other => {
+            return Err(Error::Unsupported(format!(
+                "jks::encode_store 不支援 {other}"
+            )))
+        }
+    };
+    let mut out = Vec::new();
+    out.extend(magic.to_be_bytes());
+    out.extend(2u32.to_be_bytes());
+    out.extend((entries.len() as u32).to_be_bytes());
+    let now_ms: u64 = (crate::cert::now_ts() as u64) * 1000;
+    let ts = |c: &Option<i64>| c.map(|v| (v.max(0) as u64) * 1000).unwrap_or(now_ms);
+    let put_utf = |out: &mut Vec<u8>, s: &str| -> Result<()> {
+        let b = s.as_bytes();
+        if b.len() > u16::MAX as usize {
+            return Err(Error::Other("別名過長".into()));
+        }
+        out.extend((b.len() as u16).to_be_bytes());
+        out.extend(b);
+        Ok(())
+    };
+    let put_cert = |out: &mut Vec<u8>, der: &[u8]| {
+        out.extend(5u16.to_be_bytes());
+        out.extend(b"X.509");
+        out.extend((der.len() as u32).to_be_bytes());
+        out.extend(der);
+    };
+    for e in entries {
+        match e {
+            WriteEntry::PrivateKey {
+                alias,
+                created,
+                key,
+                chain,
+            } => {
+                out.extend(1u32.to_be_bytes());
+                put_utf(&mut out, alias)?;
+                out.extend(ts(created).to_be_bytes());
+                let epki = match key {
+                    KeyBlob::Plain { pkcs8, password } => match format {
+                        StoreFormat::Jks => jks_protect(pkcs8, password),
+                        _ => jceks_protect(pkcs8, password)?,
+                    },
+                    KeyBlob::Protected(b) => {
+                        let alg = protected_key_algorithm(b).unwrap_or_default();
+                        // JKS 只能讀取 JKS KeyProtector；JCEKS 兩種都能讀
+                        if format == StoreFormat::Jks && alg != OID_JKS_KEY_PROTECTOR {
+                            return Err(Error::NeedPassword(format!(
+                                "「{alias}」的私鑰需要先解密才能轉存為 JKS"
+                            )));
+                        }
+                        b.to_vec()
+                    }
+                };
+                out.extend((epki.len() as u32).to_be_bytes());
+                out.extend(&epki);
+                out.extend((chain.len() as u32).to_be_bytes());
+                for c in chain {
+                    put_cert(&mut out, c);
+                }
+            }
+            WriteEntry::TrustedCert {
+                alias,
+                created,
+                cert,
+            } => {
+                out.extend(2u32.to_be_bytes());
+                put_utf(&mut out, alias)?;
+                out.extend(ts(created).to_be_bytes());
+                put_cert(&mut out, cert);
+            }
+        }
+    }
+    let d = store_digest(store_password, &out);
+    out.extend(d);
+    Ok(out)
+}
+
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut b = [0u8; N];
+    getrandom::getrandom(&mut b).expect("無法取得系統亂數");
+    b
+}
+
+fn jks_protect(plain: &[u8], password: &str) -> Vec<u8> {
+    let pw = password_utf16be(password);
+    let salt = random_bytes::<20>().to_vec();
+    let enc = jks_xor(&pw, &salt, plain);
+    let mut h = Sha1::new();
+    h.update(&pw);
+    h.update(plain);
+    let check = h.finalize();
+    let mut data = salt;
+    data.extend(enc);
+    data.extend(check);
+
+    let mut alg = der::encode(der::TAG_OID, &der::oid_from_string(OID_JKS_KEY_PROTECTOR));
+    alg.extend(der::encode(der::TAG_NULL, &[]));
+    let mut seq = der::encode(der::TAG_SEQUENCE, &alg);
+    seq.extend(der::encode(der::TAG_OCTET_STRING, &data));
+    der::encode(der::TAG_SEQUENCE, &seq)
+}
+
+const JCEKS_ITERATIONS: u32 = 200_000;
+
+fn jceks_derive(password: &str, salt: &[u8; 8], iterations: u64) -> [u8; 32] {
+    let mut s = *salt;
     if s[..4] == s[4..] {
-        // Sun 實作的特殊處理：前後兩半相同時反轉前半
         for i in 0..2 {
             s.swap(i, 3 - i);
         }
@@ -312,98 +481,25 @@ fn jceks_unprotect(data: &[u8], params: &[u8], password: &str) -> Result<Vec<u8>
         }
         derived[i * 16..i * 16 + 16].copy_from_slice(&to_hash);
     }
-    let dec = cbc::Decryptor::<des::TdesEde3>::new_from_slices(&derived[..24], &derived[24..])
-        .map_err(|e| Error::Other(format!("3DES 初始化失敗：{e}")))?;
-    let plain = dec
-        .decrypt_padded_vec_mut::<Pkcs7>(data)
-        .map_err(|_| Error::WrongPassword("私鑰密碼錯誤".into()))?;
-    // 驗證結果是 DER SEQUENCE
-    match der::expect(&plain, der::TAG_SEQUENCE) {
-        Ok((t, rest)) if rest.is_empty() && !t.content.is_empty() => Ok(plain),
-        _ => Err(Error::WrongPassword("私鑰密碼錯誤".into())),
-    }
+    derived
 }
 
-/// 要寫入 JKS 的條目（主要供測試與工具使用）。
-pub enum WriteEntry<'a> {
-    PrivateKey {
-        alias: &'a str,
-        pkcs8: &'a [u8],
-        chain: Vec<&'a [u8]>,
-    },
-    TrustedCert {
-        alias: &'a str,
-        cert: &'a [u8],
-    },
-}
+fn jceks_protect(plain: &[u8], password: &str) -> Result<Vec<u8>> {
+    use cbc::cipher::BlockEncryptMut;
+    let salt = random_bytes::<8>();
+    let derived = jceks_derive(password, &salt, JCEKS_ITERATIONS as u64);
+    let enc = cbc::Encryptor::<des::TdesEde3>::new_from_slices(&derived[..24], &derived[24..])
+        .map_err(|e| Error::Other(format!("3DES 初始化失敗：{e}")))?
+        .encrypt_padded_vec_mut::<Pkcs7>(plain);
 
-/// 編碼成 JKS（version 2）。
-pub fn encode(entries: &[WriteEntry], store_password: &str, key_password: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend(JKS_MAGIC.to_be_bytes());
-    out.extend(2u32.to_be_bytes());
-    out.extend((entries.len() as u32).to_be_bytes());
-    let ts: u64 = (crate::cert::now_ts() as u64) * 1000;
-    let put_utf = |out: &mut Vec<u8>, s: &str| {
-        out.extend((s.len() as u16).to_be_bytes());
-        out.extend(s.as_bytes());
-    };
-    let put_cert = |out: &mut Vec<u8>, der: &[u8]| {
-        out.extend(5u16.to_be_bytes());
-        out.extend(b"X.509");
-        out.extend((der.len() as u32).to_be_bytes());
-        out.extend(der);
-    };
-    for e in entries {
-        match e {
-            WriteEntry::PrivateKey {
-                alias,
-                pkcs8,
-                chain,
-            } => {
-                out.extend(1u32.to_be_bytes());
-                put_utf(&mut out, alias);
-                out.extend(ts.to_be_bytes());
-                let epki = jks_protect(pkcs8, key_password, alias);
-                out.extend((epki.len() as u32).to_be_bytes());
-                out.extend(&epki);
-                out.extend((chain.len() as u32).to_be_bytes());
-                for c in chain {
-                    put_cert(&mut out, c);
-                }
-            }
-            WriteEntry::TrustedCert { alias, cert } => {
-                out.extend(2u32.to_be_bytes());
-                put_utf(&mut out, alias);
-                out.extend(ts.to_be_bytes());
-                put_cert(&mut out, cert);
-            }
-        }
-    }
-    let d = store_digest(store_password, &out);
-    out.extend(d);
-    out
-}
-
-fn jks_protect(plain: &[u8], password: &str, seed: &str) -> Vec<u8> {
-    let pw = password_utf16be(password);
-    let mut h = Sha1::new();
-    h.update(seed.as_bytes());
-    h.update(crate::cert::now_ts().to_be_bytes());
-    h.update(plain.len().to_be_bytes());
-    let salt = h.finalize().to_vec();
-    let enc = jks_xor(&pw, &salt, plain);
-    let mut h = Sha1::new();
-    h.update(&pw);
-    h.update(plain);
-    let check = h.finalize();
-    let mut data = salt;
-    data.extend(enc);
-    data.extend(check);
-
-    let mut alg = der::encode(der::TAG_OID, &der::oid_from_string(OID_JKS_KEY_PROTECTOR));
-    alg.extend(der::encode(der::TAG_NULL, &[]));
+    let mut params = der::encode(der::TAG_OCTET_STRING, &salt);
+    params.extend(der::encode(
+        der::TAG_INTEGER,
+        &der::uint_bytes(JCEKS_ITERATIONS as u64),
+    ));
+    let mut alg = der::encode(der::TAG_OID, &der::oid_from_string(OID_PBE_MD5_3DES));
+    alg.extend(der::encode(der::TAG_SEQUENCE, &params));
     let mut seq = der::encode(der::TAG_SEQUENCE, &alg);
-    seq.extend(der::encode(der::TAG_OCTET_STRING, &data));
-    der::encode(der::TAG_SEQUENCE, &seq)
+    seq.extend(der::encode(der::TAG_OCTET_STRING, &enc));
+    Ok(der::encode(der::TAG_SEQUENCE, &seq))
 }

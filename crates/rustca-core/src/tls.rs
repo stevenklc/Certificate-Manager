@@ -81,13 +81,7 @@ pub fn identity_from_keystore(ks: &Keystore, alias: Option<&str>) -> Result<Iden
         return Err(Error::Other(format!("「{}」沒有憑證", entry.alias)));
     }
     let key = match &entry.key {
-        KeyState::Decrypted { format, der } => match format {
-            KeyFormat::Pkcs8 => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                normalize_ec_pkcs8(der, &entry.chain[0]).unwrap_or_else(|| der.clone()),
-            )),
-            KeyFormat::Pkcs1 => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der.clone())),
-            KeyFormat::Sec1 => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der.clone())),
-        },
+        KeyState::Decrypted { format, der } => private_key_der(*format, der, &entry.chain[0]),
         KeyState::Locked(r) => {
             return Err(Error::NeedPassword(format!(
                 "「{}」的私鑰無法使用：{r}",
@@ -157,6 +151,46 @@ fn normalize_ec_pkcs8(pkcs8: &[u8], leaf: &CertInfo) -> Option<Vec<u8>> {
         pki_new.extend_from_slice(extra.raw);
     }
     Some(der::encode(TAG_SEQUENCE, &pki_new))
+}
+
+fn private_key_der(format: KeyFormat, der: &[u8], leaf: &CertInfo) -> PrivateKeyDer<'static> {
+    match format {
+        KeyFormat::Pkcs8 => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            normalize_ec_pkcs8(der, leaf).unwrap_or_else(|| der.to_vec()),
+        )),
+        KeyFormat::Pkcs1 => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der.to_vec())),
+        KeyFormat::Sec1 => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der.to_vec())),
+    }
+}
+
+/// 檢查私鑰是否與憑證的公鑰相符。None 表示無法判斷（金鑰類型不支援）。
+pub fn key_matches_cert(format: KeyFormat, der: &[u8], cert: &CertInfo) -> Option<bool> {
+    let key = private_key_der(format, der, cert);
+    let signer = provider().key_provider.load_private_key(key).ok()?;
+    let spki = signer.public_key()?;
+    let (_, x) = x509_parser::prelude::X509Certificate::from_der(&cert.der).ok()?;
+    Some(spki.as_ref() == x.public_key().raw)
+}
+
+/// 由「憑證檔 + 私鑰檔」組成 TLS 身分（例如 client.cer + client.key）。
+pub fn identity_from_cert_and_key(cert_ks: &Keystore, key_ks: &Keystore) -> Result<Identity> {
+    let certs: Vec<CertInfo> = cert_ks.all_certs().into_iter().cloned().collect();
+    if certs.is_empty() {
+        return Err(Error::Other(format!("{} 中沒有憑證", cert_ks.name())));
+    }
+    let key_entry = key_ks
+        .private_key_entries()
+        .next()
+        .ok_or_else(|| Error::Other(format!("{} 中沒有私鑰", key_ks.name())))?;
+    let entry = crate::edit::entry_from_cert_and_key("identity", &certs, key_entry)?;
+    let KeyState::Decrypted { format, der } = &entry.key else {
+        return Err(Error::NeedPassword("私鑰尚未解密".into()));
+    };
+    Ok(Identity {
+        label: format!("{} + {}", cert_ks.name(), key_ks.name()),
+        key: private_key_der(*format, der, &entry.chain[0]),
+        chain: entry.chain.clone(),
+    })
 }
 
 /// 收集多個憑證庫的信任錨點。
@@ -255,6 +289,8 @@ pub struct HandshakeReport {
     pub trust_anchor_count: usize,
     /// 經由的 proxy（不含帳密）
     pub via_proxy: Option<String>,
+    /// HTTP 請求結果（有送出請求時）
+    pub http: Option<HttpResponse>,
     pub failure: Option<Failure>,
     pub transcript: Vec<TranscriptLine>,
     pub warnings: Vec<String>,
@@ -843,30 +879,354 @@ pub struct RemoteOptions {
     pub trust: RemoteTrust,
     /// HTTP CONNECT proxy，例如 http://user:pass@proxy:8080；None 表示直連
     pub proxy: Option<String>,
+    /// 交握成功後送出的 HTTP 請求（測試 API 用）；None 表示只做交握
+    pub http: Option<HttpRequest>,
 }
 
-/// 解析 "host:port"。
-pub fn split_host_port(addr: &str) -> std::result::Result<(String, u16), String> {
-    let addr = addr.trim();
-    let addr = addr
-        .strip_prefix("https://")
-        .unwrap_or(addr)
-        .trim_end_matches('/');
-    if let Some(rest) = addr.strip_prefix('[') {
+/// 連線目標：主機、連接埠與（選用的）API 路徑。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub host: String,
+    pub port: u16,
+    /// 例如 "/api/v1/health?x=1"；沒有路徑時為 None
+    pub path: Option<String>,
+}
+
+/// 解析連線目標，支援：
+/// `host`、`host:port`、`[IPv6]:port`、`https://host[:port]/path?query`
+pub fn parse_target(input: &str) -> std::result::Result<Target, String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err("請輸入主機或網址".into());
+    }
+    let s = if let Some(r) = s.strip_prefix("https://") {
+        r
+    } else if s.starts_with("http://") {
+        return Err("http:// 不是 TLS 連線，請改用 https://".into());
+    } else if s.contains("://") {
+        return Err("只支援 https:// 網址".into());
+    } else {
+        s
+    };
+    let (authority, path) = match s.find(['/', '?']) {
+        Some(i) => (&s[..i], Some(&s[i..])),
+        None => (s, None),
+    };
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         let (host, tail) = rest.split_once(']').ok_or("IPv6 位址缺少 ]")?;
         let port = match tail.strip_prefix(':') {
             Some(p) => p.parse().map_err(|_| format!("連接埠不合法：{p}"))?,
             None => 443,
         };
-        return Ok((host.to_string(), port));
+        (host.to_string(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => (
+                h.to_string(),
+                p.parse().map_err(|_| format!("連接埠不合法：{p}"))?,
+            ),
+            _ => (authority.to_string(), 443),
+        }
+    };
+    if host.is_empty() {
+        return Err("缺少主機名稱".into());
     }
-    match addr.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') => Ok((
-            h.to_string(),
-            p.parse().map_err(|_| format!("連接埠不合法：{p}"))?,
-        )),
-        _ => Ok((addr.to_string(), 443)),
+    let path = path
+        .map(|p| {
+            if p.starts_with('?') {
+                format!("/{p}")
+            } else {
+                p.to_string()
+            }
+        })
+        .filter(|p| p != "/");
+    Ok(Target { host, port, path })
+}
+
+/// 解析 "host:port"（也接受完整網址，路徑會被忽略）。
+pub fn split_host_port(addr: &str) -> std::result::Result<(String, u16), String> {
+    parse_target(addr).map(|t| (t.host, t.port))
+}
+
+/// 交握後要送出的 HTTP 請求。
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method: String,
+    /// 路徑（含 query），例如 "/api/health"
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpRequest {
+    pub fn get(path: impl Into<String>) -> Self {
+        HttpRequest {
+            method: "GET".into(),
+            path: path.into(),
+            headers: vec![],
+            body: vec![],
+        }
     }
+}
+
+/// 解析 "Name: value" 形式的標頭。
+pub fn parse_header(line: &str) -> std::result::Result<(String, String), String> {
+    let (k, v) = line
+        .split_once(':')
+        .ok_or_else(|| format!("標頭格式應為「名稱: 值」：{line}"))?;
+    let k = k.trim();
+    if k.is_empty() || k.contains(char::is_whitespace) {
+        return Err(format!("標頭名稱不合法：{line}"));
+    }
+    Ok((k.to_string(), v.trim().to_string()))
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct HttpResponse {
+    /// 送出的請求列，例如 "GET /api HTTP/1.1"
+    pub request_line: String,
+    /// 送出的標頭（敏感值已遮蔽）
+    pub request_headers: Vec<(String, String)>,
+    pub status: Option<u16>,
+    pub status_line: String,
+    pub headers: Vec<(String, String)>,
+    pub body_preview: String,
+    pub body_bytes: usize,
+    pub truncated: bool,
+    pub elapsed_ms: u128,
+    pub error: Option<String>,
+}
+
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "x-api-key",
+    "api-key",
+    "apikey",
+];
+
+fn mask_header(k: &str, v: &str) -> String {
+    let lk = k.to_ascii_lowercase();
+    if SENSITIVE_HEADERS.contains(&lk.as_str()) || lk.contains("token") || lk.contains("secret") {
+        match v.split_once(' ') {
+            Some((scheme, _)) if lk.contains("authorization") => format!("{scheme} ***"),
+            _ => "***".into(),
+        }
+    } else {
+        v.to_string()
+    }
+}
+
+const MAX_BODY: usize = 1024 * 1024;
+const PREVIEW: usize = 8 * 1024;
+
+fn do_http(
+    conn: &mut ClientConnection,
+    sock: &mut TcpStream,
+    host: &str,
+    port: u16,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let start = std::time::Instant::now();
+    let host_hdr = {
+        let h = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        if port == 443 {
+            h
+        } else {
+            format!("{h}:{port}")
+        }
+    };
+    let path = if req.path.is_empty() {
+        "/".to_string()
+    } else {
+        req.path.clone()
+    };
+    let method = req.method.trim().to_ascii_uppercase();
+    let has = |name: &str| {
+        req.headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+    };
+    let mut headers: Vec<(String, String)> = Vec::new();
+    if !has("host") {
+        headers.push(("Host".into(), host_hdr));
+    }
+    if !has("user-agent") {
+        headers.push((
+            "User-Agent".into(),
+            concat!("rust-ca/", env!("CARGO_PKG_VERSION")).into(),
+        ));
+    }
+    if !has("accept") {
+        headers.push(("Accept".into(), "*/*".into()));
+    }
+    headers.extend(req.headers.iter().cloned());
+    if !has("content-length")
+        && (!req.body.is_empty() || matches!(method.as_str(), "POST" | "PUT" | "PATCH"))
+    {
+        headers.push(("Content-Length".into(), req.body.len().to_string()));
+    }
+    if !has("connection") {
+        headers.push(("Connection".into(), "close".into()));
+    }
+
+    let request_line = format!("{method} {path} HTTP/1.1");
+    let mut resp = HttpResponse {
+        request_line: request_line.clone(),
+        request_headers: headers
+            .iter()
+            .map(|(k, v)| (k.clone(), mask_header(k, v)))
+            .collect(),
+        ..Default::default()
+    };
+    let mut raw = format!("{request_line}\r\n");
+    for (k, v) in &headers {
+        raw.push_str(&format!("{k}: {v}\r\n"));
+    }
+    raw.push_str("\r\n");
+    let mut payload = raw.into_bytes();
+    payload.extend(&req.body);
+
+    let mut tls = rustls::Stream::new(conn, sock);
+    if let Err(e) = tls.write_all(&payload).and_then(|_| tls.flush()) {
+        resp.error = Some(format!("送出 HTTP 請求失敗：{e}"));
+        return resp;
+    }
+
+    // 讀取回應（直到連線關閉、內容長度滿足或達上限）
+    let mut data = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    let mut read_err = None;
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if data.len() > MAX_BODY {
+                    resp.truncated = true;
+                    break;
+                }
+                if response_complete(&data, &method) {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                read_err = Some(e);
+                break;
+            }
+        }
+    }
+    resp.elapsed_ms = start.elapsed().as_millis();
+
+    let Some(hdr_end) = find_subslice(&data, b"\r\n\r\n") else {
+        resp.error = Some(match read_err {
+            Some(e) => format!("讀取 HTTP 回應失敗：{e}"),
+            None if data.is_empty() => "Server 沒有回應任何資料就關閉連線".into(),
+            None => "HTTP 回應不完整".into(),
+        });
+        return resp;
+    };
+    let head = String::from_utf8_lossy(&data[..hdr_end]).to_string();
+    let mut lines = head.split("\r\n");
+    resp.status_line = lines.next().unwrap_or_default().to_string();
+    resp.status = resp
+        .status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok());
+    resp.headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+
+    let mut body = data[hdr_end + 4..].to_vec();
+    let chunked = resp.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+    if chunked {
+        body = decode_chunked(&body);
+    }
+    resp.body_bytes = body.len();
+    let encoded = resp.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-encoding") && !v.eq_ignore_ascii_case("identity")
+    });
+    resp.body_preview = if encoded {
+        format!("（內容經過壓縮編碼，{} bytes）", body.len())
+    } else {
+        match std::str::from_utf8(&body[..body.len().min(PREVIEW)]) {
+            Ok(t) => t.to_string(),
+            Err(e) if e.valid_up_to() > 0 && body.len() > PREVIEW => {
+                String::from_utf8_lossy(&body[..e.valid_up_to()]).into_owned()
+            }
+            Err(_) => format!("（二進位資料，{} bytes）", body.len()),
+        }
+    };
+    if body.len() > PREVIEW {
+        resp.truncated = true;
+    }
+    if let (Some(e), None) = (read_err, resp.status) {
+        resp.error = Some(format!("讀取 HTTP 回應失敗：{e}"));
+    }
+    resp
+}
+
+fn find_subslice(h: &[u8], n: &[u8]) -> Option<usize> {
+    h.windows(n.len()).position(|w| w == n)
+}
+
+fn response_complete(data: &[u8], method: &str) -> bool {
+    let Some(end) = find_subslice(data, b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    if method == "HEAD" || status == 204 || status == 304 || (100..200).contains(&status) {
+        return true;
+    }
+    let body = &data[end + 4..];
+    for line in head.lines() {
+        if let Some(v) = line.strip_prefix("content-length:") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                return body.len() >= n;
+            }
+        }
+        if line.starts_with("transfer-encoding:") && line.contains("chunked") {
+            return find_subslice(body, b"\r\n0\r\n\r\n").is_some()
+                || body.starts_with(b"0\r\n\r\n");
+        }
+    }
+    false
+}
+
+fn decode_chunked(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(i) = find_subslice(b, b"\r\n") {
+        let size_str = String::from_utf8_lossy(&b[..i]);
+        let size =
+            usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16).unwrap_or(0);
+        b = &b[i + 2..];
+        if size == 0 || b.len() < size {
+            out.extend_from_slice(&b[..size.min(b.len())]);
+            break;
+        }
+        out.extend_from_slice(&b[..size]);
+        b = &b[(size + 2).min(b.len())..];
+    }
+    out
 }
 
 type ConnectError = (String, &'static str);
@@ -1256,7 +1616,7 @@ pub fn no_proxy_match(host: &str, no_proxy: &str) -> bool {
 
 /// 以 Client 身分連到遠端 Server 進行交握。
 pub fn connect_remote(opts: &RemoteOptions, client: Option<&Identity>) -> HandshakeReport {
-    let (host, port) = match split_host_port(&opts.address) {
+    let (host, port) = match parse_target(&opts.address).map(|t| (t.host, t.port)) {
         Ok(v) => v,
         Err(e) => {
             let mut r = HandshakeReport::new("remote", opts.address.clone(), String::new());
@@ -1322,7 +1682,7 @@ pub fn connect_remote(opts: &RemoteOptions, client: Option<&Identity>) -> Handsh
             ),
             None => None,
         };
-        Ok(ClientConfig::builder_with_details(provider.clone(), time)
+        let mut cfg = ClientConfig::builder_with_details(provider.clone(), time)
             .with_protocol_versions(&opts.version.versions())
             .map_err(|e| e.to_string())?
             .dangerous()
@@ -1334,7 +1694,11 @@ pub fn connect_remote(opts: &RemoteOptions, client: Option<&Identity>) -> Handsh
             .with_client_cert_resolver(Arc::new(RecordingResolver {
                 key,
                 seen: seen_auth.clone(),
-            })))
+            }));
+        if opts.http.is_some() {
+            cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        }
+        Ok(cfg)
     })();
     let cfg = match cfg {
         Ok(c) => c,
@@ -1434,6 +1798,9 @@ pub fn connect_remote(opts: &RemoteOptions, client: Option<&Identity>) -> Handsh
     match result {
         Ok(()) => {
             report.success = true;
+            if let Some(req) = &opts.http {
+                report.http = Some(do_http(&mut conn, &mut sock, &host, port, req));
+            }
             conn.send_close_notify();
             let mut out = Vec::new();
             let _ = conn.write_tls(&mut out);

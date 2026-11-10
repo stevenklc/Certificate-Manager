@@ -6,12 +6,15 @@ use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use rustca_core::chain::LinkSource;
 use rustca_core::{
-    build_chain, format_ts, load_file, now_ts, BuiltChain, CertInfo, ChainEnd, KeyState, Keystore,
-    LoadOptions, Matcher,
+    build_chain, edit, format_ts, load_file, now_ts, BuiltChain, CertInfo, ChainEnd, EntryKind,
+    KeyState, Keystore, LoadOptions, Matcher, StoreFormat,
 };
 
 use crate::handshake::HandshakeState;
-use crate::widgets::{cert_grid, short_dn, status_text, BLUE, GREEN, RED, YELLOW};
+use crate::manage::{self, Dialog, Effect, GenChain, Kind};
+use crate::tools::{verify_window, JavaTest};
+use crate::widgets::{cert_grid, pick_cert_files, short_dn, status_text, BLUE, GREEN, RED, YELLOW};
+use rustca_core::edit::{CertFormat, Verification};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
@@ -44,6 +47,12 @@ pub struct App {
     hs: HandshakeState,
     chain_cache: Option<((usize, usize), BuiltChain)>,
     devshot: Option<crate::devshot::DevShot>,
+    /// 與 stores 一一對應：是否有未儲存的變更
+    dirty: Vec<bool>,
+    dialog: Option<Dialog>,
+    allow_close: bool,
+    verify_view: Option<Verification>,
+    java_test: Option<JavaTest>,
 }
 
 impl App {
@@ -62,6 +71,11 @@ impl App {
             hs: HandshakeState::default(),
             chain_cache: None,
             devshot: crate::devshot::DevShot::from_env(),
+            dirty: Vec::new(),
+            dialog: None,
+            allow_close: false,
+            verify_view: None,
+            java_test: None,
         }
     }
 
@@ -87,16 +101,23 @@ impl App {
                         i
                     }
                     _ => {
-                        // 同一個檔案重複開啟時取代舊的
+                        // 同一個檔案重複開啟時取代舊的（有未儲存變更時保留舊的）
                         if let Some(i) = self.stores.iter().position(|s| s.path == path) {
+                            if self.dirty[i] {
+                                self.selected_store = Some(i);
+                                self.error(format!("{name} 已開啟且有未儲存的變更"));
+                                return;
+                            }
                             self.stores[i] = ks;
                             i
                         } else {
                             self.stores.push(ks);
+                            self.dirty.push(false);
                             self.stores.len() - 1
                         }
                     }
                 };
+                self.dirty[idx] = false;
                 self.selected_store = Some(idx);
                 self.selected_entry = None;
                 self.chain_cache = None;
@@ -137,8 +158,18 @@ impl App {
         }
     }
 
+    fn add_store(&mut self, ks: Keystore) {
+        self.stores.push(ks);
+        self.dirty.push(false);
+        self.selected_store = Some(self.stores.len() - 1);
+        self.selected_entry = None;
+        self.chain_cache = None;
+        self.hs.on_stores_changed(self.stores.len());
+    }
+
     fn close_store(&mut self, i: usize) {
         self.stores.remove(i);
+        self.dirty.remove(i);
         self.selected_store = None;
         self.selected_entry = None;
         self.chain_cache = None;
@@ -161,19 +192,35 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("📂 開啟檔案…").clicked() {
-                    if let Some(files) = rfd::FileDialog::new()
-                        .add_filter(
-                            "憑證庫 / 憑證",
-                            &[
-                                "jks", "jceks", "keystore", "p12", "pfx", "pem", "crt", "cer",
-                                "der", "p7b", "key",
-                            ],
-                        )
-                        .add_filter("所有檔案", &["*"])
-                        .pick_files()
-                    {
-                        self.queue.extend(files);
-                    }
+                    self.queue.extend(pick_cert_files());
+                }
+                if ui.button("🆕 新增憑證庫…").clicked() {
+                    self.dialog = Some(
+                        Kind::NewStore {
+                            path: None,
+                            format: StoreFormat::Jks,
+                            pw: String::new(),
+                            pw2: String::new(),
+                        }
+                        .into(),
+                    );
+                }
+                if ui
+                    .button("🔁 轉換憑證格式…")
+                    .on_hover_text(
+                        "PEM ⇄ DER（.cer）⇄ PKCS#7（.p7b），也可從 .p12 / .jks 取出憑證與私鑰",
+                    )
+                    .clicked()
+                {
+                    self.dialog = Some(
+                        Kind::ConvertCert {
+                            file: None,
+                            file_pw: String::new(),
+                            format: CertFormat::Pem,
+                            with_key: false,
+                        }
+                        .into(),
+                    );
                 }
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::Browse, "📚 憑證庫");
@@ -253,7 +300,9 @@ impl App {
                                 .count();
                             let locked = ks
                                 .private_key_entries()
-                                .any(|e| matches!(e.key, KeyState::Locked(_)));
+                                .any(|e| matches!(e.key, KeyState::Locked(_)))
+                                || (edit::is_writable(ks.format) && ks.store_password.is_none());
+                            let dirty = self.dirty.get(i).copied().unwrap_or(false);
                             ui.group(|ui| {
                                 ui.set_width(ui.available_width());
                                 let sel = self.selected_store == Some(i);
@@ -272,9 +321,13 @@ impl App {
                                     if bad > 0 {
                                         ui.colored_label(YELLOW, format!("⚠ {bad} 張需注意"));
                                     }
+                                    if dirty {
+                                        ui.colored_label(YELLOW, "● 未儲存");
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     if locked
+                                        && !dirty
                                         && ui
                                             .small_button("🔓 解鎖")
                                             .on_hover_text("輸入密碼以解密私鑰")
@@ -302,7 +355,11 @@ impl App {
                     });
                 }
                 if let Some(i) = close {
-                    self.close_store(i);
+                    if self.dirty.get(i).copied().unwrap_or(false) {
+                        self.dialog = Some(Kind::ConfirmClose { store: Some(i) }.into());
+                    } else {
+                        self.close_store(i);
+                    }
                 }
             });
     }
@@ -641,6 +698,278 @@ impl App {
         }
     }
 
+    /// 目前操作的憑證庫：選取條目所在的檔案，否則為左側選取的檔案。
+    fn target_store(&self) -> Option<usize> {
+        self.selected_entry
+            .map(|(s, _)| s)
+            .or(self.selected_store)
+            .filter(|i| *i < self.stores.len())
+    }
+
+    fn manage_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(si) = self.target_store() else {
+            ui.weak("選擇左側的檔案即可管理（匯入、刪除、改名、修改密碼、另存新檔）");
+            return;
+        };
+        let ks = &self.stores[si];
+        let writable = edit::is_writable(ks.format);
+        let can_edit = writable && ks.store_password.is_some();
+        let dirty = self.dirty[si];
+        let entry = self
+            .selected_entry
+            .filter(|(s, _)| *s == si)
+            .and_then(|(_, e)| ks.entries.get(e));
+        let mut open: Option<Kind> = None;
+        let mut save = false;
+        let mut export = None;
+        let mut java = false;
+        let mut verify = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!("🛠 {}", ks.name()));
+            if !writable {
+                ui.colored_label(
+                    YELLOW,
+                    format!("{} 為唯讀格式，可「另存新檔」轉成 JKS / PKCS#12", ks.format),
+                );
+            } else if !can_edit {
+                ui.colored_label(YELLOW, "未以密碼開啟，請先按左側「解鎖」");
+            }
+            ui.separator();
+            if ui
+                .add_enabled(can_edit, egui::Button::new("➕ 匯入憑證"))
+                .clicked()
+            {
+                open = Some(Kind::ImportCert {
+                    store: si,
+                    file: None,
+                    file_pw: String::new(),
+                    alias: String::new(),
+                    overwrite: false,
+                });
+            }
+            if ui
+                .add_enabled(can_edit, egui::Button::new("➕ 匯入金鑰對"))
+                .clicked()
+            {
+                open = Some(Kind::ImportKey {
+                    store: si,
+                    pair: false,
+                    src: None,
+                    src_pw: String::new(),
+                    src_alias: String::new(),
+                    cert: None,
+                    key: None,
+                    alias: String::new(),
+                    key_pw: String::new(),
+                    key_pw2: String::new(),
+                    overwrite: false,
+                });
+            }
+            if ui
+                .add_enabled(can_edit, egui::Button::new("🔐 改憑證庫密碼"))
+                .clicked()
+            {
+                open = Some(Kind::StorePass {
+                    store: si,
+                    new: String::new(),
+                    new2: String::new(),
+                    also_keys: true,
+                });
+            }
+            if ui
+                .add_enabled(can_edit && dirty, egui::Button::new("💾 儲存"))
+                .on_hover_text("寫回原檔（會先建立 .bak 備份）")
+                .clicked()
+            {
+                save = true;
+            }
+            if ui.button("💾 另存新檔 / 轉換…").clicked() {
+                let format = if writable {
+                    ks.format
+                } else {
+                    StoreFormat::Jks
+                };
+                open = Some(Kind::SaveAs {
+                    store: si,
+                    path: None,
+                    format,
+                    pw: String::new(),
+                    pw2: String::new(),
+                    legacy: false,
+                });
+            }
+            ui.separator();
+            if ui
+                .add_enabled(can_edit, egui::Button::new("🏭 製作憑證鏈…"))
+                .on_hover_text("建立根 CA / 中繼 CA / Server、Client 憑證，或用庫中的 CA 簽發")
+                .clicked()
+            {
+                open = Some(Kind::GenChain(Box::new(GenChain::new(si))));
+            }
+            let java_ok = writable && ks.store_password.is_some();
+            if ui
+                .add_enabled(java_ok, egui::Button::new("☕ Java 相容性測試"))
+                .on_hover_text("用本機各版本 Java 的 keytool 讀取此憑證庫並解開私鑰")
+                .clicked()
+            {
+                java = true;
+            }
+        });
+        if let Some(e) = entry {
+            let alias = e.alias.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("條目「{alias}」：")).strong());
+                if ui
+                    .add_enabled(can_edit, egui::Button::new("✏ 改名"))
+                    .clicked()
+                {
+                    open = Some(Kind::Rename {
+                        store: si,
+                        old: alias.clone(),
+                        new: alias.clone(),
+                    });
+                }
+                if ui
+                    .add_enabled(
+                        can_edit && e.kind != EntryKind::SecretKey,
+                        egui::Button::new("🔄 替換憑證鏈"),
+                    )
+                    .on_hover_text(
+                        "同一別名替換憑證 / 憑證鏈（續約、匯入 CA 回覆），替換後自動驗證",
+                    )
+                    .clicked()
+                {
+                    open = Some(Kind::UpdateCert {
+                        store: si,
+                        alias: alias.clone(),
+                        file: None,
+                        file_pw: String::new(),
+                    });
+                }
+                if ui
+                    .add_enabled(
+                        can_edit
+                            && e.kind == EntryKind::PrivateKey
+                            && ks.format != StoreFormat::Pkcs12,
+                        egui::Button::new("🔑 改私鑰密碼"),
+                    )
+                    .clicked()
+                {
+                    open = Some(Kind::KeyPass {
+                        store: si,
+                        alias: alias.clone(),
+                        current: String::new(),
+                        new: String::new(),
+                        new2: String::new(),
+                    });
+                }
+                if ui
+                    .add_enabled(!e.chain.is_empty(), egui::Button::new("✅ 驗證憑證鏈"))
+                    .on_hover_text("檢查私鑰相符、順序、簽章、有效期限與根憑證")
+                    .clicked()
+                {
+                    verify = Some(alias.clone());
+                }
+                if ui
+                    .add_enabled(!e.chain.is_empty(), egui::Button::new("📤 匯出憑證鏈…"))
+                    .clicked()
+                {
+                    export = Some(e.clone());
+                }
+                if ui
+                    .add_enabled(
+                        can_edit,
+                        egui::Button::new(RichText::new("🗑 刪除").color(RED)),
+                    )
+                    .clicked()
+                {
+                    open = Some(Kind::Delete {
+                        store: si,
+                        alias: alias.clone(),
+                    });
+                }
+            });
+        }
+        if let Some(k) = open {
+            self.dialog = Some(k.into());
+        }
+        if save {
+            match manage::save_in_place(&mut self.stores[si]) {
+                Ok(m) => {
+                    self.dirty[si] = false;
+                    self.chain_cache = None;
+                    self.info(m);
+                }
+                Err(e) => self.error(e),
+            }
+        }
+        if java {
+            let mut t = JavaTest::new(self.stores[si].clone(), self.dirty[si]);
+            t.start(ui.ctx());
+            self.java_test = Some(t);
+        }
+        if let Some(a) = verify {
+            match edit::verify_entry(&self.stores[si], &a, now_ts()) {
+                Ok(v) => self.verify_view = Some(v),
+                Err(e) => self.error(e.to_string()),
+            }
+        }
+        if let Some(e) = export {
+            match manage::export_entry(&e, true) {
+                Ok(Some(m)) => self.info(m),
+                Ok(None) => {}
+                Err(m) => self.error(m),
+            }
+        }
+    }
+
+    fn manage_dialog(&mut self, ctx: &egui::Context) {
+        let Some(d) = self.dialog.as_mut() else {
+            return;
+        };
+        match manage::show(d, ctx, &self.stores) {
+            Some(false) => self.dialog = None,
+            Some(true) => match manage::apply(&d.kind, &mut self.stores) {
+                Ok(effect) => {
+                    self.dialog = None;
+                    self.chain_cache = None;
+                    match effect {
+                        Effect::Modified(i, m) => {
+                            self.dirty[i] = true;
+                            if let Some((s, e)) = self.selected_entry {
+                                if s == i && e >= self.stores[i].entries.len() {
+                                    self.selected_entry = None;
+                                }
+                            }
+                            self.info(format!("{m}（尚未儲存）"));
+                        }
+                        Effect::Verified(i, m, v) => {
+                            self.dirty[i] = true;
+                            self.info(format!("{m}（尚未儲存）"));
+                            self.verify_view = Some(v);
+                        }
+                        Effect::Done(m) => self.info(m),
+                        Effect::Saved(i, m) => {
+                            self.dirty[i] = false;
+                            self.info(m);
+                        }
+                        Effect::Created(ks, m) => {
+                            self.add_store(*ks);
+                            self.info(m);
+                        }
+                        Effect::Close(Some(i)) => self.close_store(i),
+                        Effect::Close(None) => {
+                            self.allow_close = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+                Err(e) => d.error = Some(e),
+            },
+            None => {}
+        }
+    }
+
     fn password_dialog(&mut self, ctx: &egui::Context) {
         let Some(p) = self.pending.as_mut() else {
             return;
@@ -712,7 +1041,16 @@ impl eframe::App for App {
                 .collect()
         });
         self.queue.extend(dropped);
+        self.queue.append(&mut self.hs.open_requests);
         self.handle_queue();
+        // 有未儲存變更時，關閉視窗前先確認
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && self.dirty.iter().any(|d| *d)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = Some(Kind::ConfirmClose { store: None }.into());
+        }
         if let Some(mut shot) = self.devshot.take() {
             if !self.stores.is_empty() && self.queue.is_empty() {
                 if shot.tab == "handshake" {
@@ -728,12 +1066,38 @@ impl eframe::App for App {
                         .position(|e| e.kind == rustca_core::EntryKind::PrivateKey)
                         .unwrap_or(0);
                     self.selected_entry = Some((0, first));
-                    if !shot.tab.is_empty() {
-                        self.search = shot.tab.clone();
-                        self.selected_store = None;
+                    match shot.tab.as_str() {
+                        "gen" => {
+                            let mut g = GenChain::new(0);
+                            g.leaf_cn = "api.example.com".into();
+                            g.sans = "api.example.com, 10.0.0.5".into();
+                            self.dialog = Some(Kind::GenChain(Box::new(g)).into());
+                        }
+                        "java" => {
+                            let mut t = JavaTest::new(self.stores[0].clone(), false);
+                            t.start(ctx);
+                            self.java_test = Some(t);
+                        }
+                        "convert" => {
+                            self.dialog = Some(
+                                Kind::ConvertCert {
+                                    file: Some(self.stores[0].path.clone()),
+                                    file_pw: String::new(),
+                                    format: CertFormat::P7b,
+                                    with_key: false,
+                                }
+                                .into(),
+                            );
+                        }
+                        "" => {}
+                        t => {
+                            self.search = t.to_string();
+                            self.selected_store = None;
+                        }
                     }
                 }
             }
+            shot.hold = self.java_test.as_ref().is_some_and(|t| t.is_running());
             if !shot.tick(ctx) {
                 self.devshot = Some(shot);
             }
@@ -757,6 +1121,8 @@ impl eframe::App for App {
                             );
                         });
                     } else {
+                        self.manage_bar(ui);
+                        ui.separator();
                         self.entry_table(ui);
                     }
                 });
@@ -768,6 +1134,19 @@ impl eframe::App for App {
             }
         }
         self.password_dialog(ctx);
+        self.manage_dialog(ctx);
+        if let Some(v) = &self.verify_view {
+            if !verify_window(ctx, v) {
+                self.verify_view = None;
+            }
+        }
+        if let Some(t) = self.java_test.as_mut() {
+            if !t.ui(ctx) {
+                self.java_test = None;
+            } else if t.is_running() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
 
         // 讓交握執行緒結束時能更新畫面
         if self.hs.is_running() {

@@ -1,5 +1,7 @@
 //! 共用小元件。
 
+use std::path::PathBuf;
+
 use eframe::egui::{self, Color32, RichText};
 use rustca_core::{format_ts, CertInfo, ValidityStatus};
 
@@ -89,4 +91,26 @@ pub fn short_dn(dn: &str) -> String {
         .find_map(|p| p.strip_prefix("CN="))
         .map(|s| s.to_string())
         .unwrap_or_else(|| dn.to_string())
+}
+
+/// 支援開啟的副檔名。
+pub const CERT_EXTS: &[&str] = &[
+    "jks", "jceks", "keystore", "p12", "pfx", "pem", "crt", "cer", "der", "p7b", "key",
+];
+
+/// 選擇要開啟的憑證 / 憑證庫檔案（可多選）。
+pub fn pick_cert_files() -> Vec<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("憑證庫 / 憑證 / 私鑰", CERT_EXTS)
+        .add_filter("所有檔案", &["*"])
+        .pick_files()
+        .unwrap_or_default()
+}
+
+/// 選擇單一檔案。
+pub fn pick_cert_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("憑證庫 / 憑證 / 私鑰", CERT_EXTS)
+        .add_filter("所有檔案", &["*"])
+        .pick_file()
 }

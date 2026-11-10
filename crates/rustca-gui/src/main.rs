@@ -5,13 +5,15 @@ mod app;
 mod devshot;
 mod fonts;
 mod handshake;
+mod manage;
+mod tools;
 mod widgets;
 
 fn main() -> eframe::Result {
     rustca_core::init_local_offset();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("RUST-CA 憑證庫檢視器")
+            .with_title("RUST-CA 憑證庫管理工具")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 560.0])
             .with_drag_and_drop(true),

@@ -1,6 +1,7 @@
 //! RUST-CA 命令列工具：查看 keystore、憑證鏈、搜尋關鍵字、模擬 TLS 交握。
 
 mod console;
+mod manage;
 mod output;
 mod store;
 
@@ -8,7 +9,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rustca_core::tls::{self, LocalOptions, RemoteOptions, RemoteTrust, TlsVersion};
 use rustca_core::{build_chain, now_ts, parse_date, search, CertInfo};
@@ -101,6 +102,9 @@ enum Cmd {
     /// 模擬 TLS 交握
     #[command(subcommand)]
     Handshake(HandshakeCmd),
+    /// 憑證庫管理：匯入、刪除、改名、更新憑證、修改密碼、轉換、匯出
+    #[command(subcommand, alias = "m")]
+    Manage(manage::ManageCmd),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -135,6 +139,106 @@ struct CommonTls {
     at: Option<String>,
 }
 
+/// Client 身分：憑證庫（含私鑰），或「憑證檔 + 私鑰檔」。
+#[derive(Args)]
+struct ClientIdArgs {
+    /// Client 憑證庫（mTLS 用，需含私鑰：.p12 / .jks / .pem…）
+    #[arg(long, conflicts_with_all = ["client_cert", "client_key"])]
+    client: Option<PathBuf>,
+    /// Client 憑證庫中的別名（預設第一個私鑰條目）
+    #[arg(long)]
+    client_alias: Option<String>,
+    #[arg(long, env = "RUST_CA_CLIENT_PASSWORD", hide_env_values = true)]
+    client_password: Option<String>,
+    /// Client 憑證檔（.cer / .crt / .pem，可含中繼憑證；與 --client-key 一起使用）
+    #[arg(long, requires = "client_key")]
+    client_cert: Option<PathBuf>,
+    /// Client 私鑰檔（PEM；與 --client-cert 一起使用）
+    #[arg(long, requires = "client_cert")]
+    client_key: Option<PathBuf>,
+}
+
+impl ClientIdArgs {
+    fn is_set(&self) -> bool {
+        self.client.is_some() || self.client_cert.is_some()
+    }
+
+    fn load(&self) -> Result<Option<tls::Identity>> {
+        if let Some(f) = &self.client {
+            let ks = StoreOpener::with_password(self.client_password.clone()).open(f, true)?;
+            return Ok(Some(tls::identity_from_keystore(
+                &ks,
+                self.client_alias.as_deref(),
+            )?));
+        }
+        if let (Some(c), Some(k)) = (&self.client_cert, &self.client_key) {
+            let cks = StoreOpener::with_password(None).open(c, false)?;
+            let kks = StoreOpener::with_password(self.client_password.clone()).open(k, true)?;
+            return Ok(Some(tls::identity_from_cert_and_key(&cks, &kks)?));
+        }
+        Ok(None)
+    }
+}
+
+/// 交握後送出 HTTP 請求（測試 API）。
+#[derive(Args)]
+struct HttpArgs {
+    /// 交握成功後送出 HTTP 請求（目標是網址且含路徑時會自動送出）
+    #[arg(long)]
+    http: bool,
+    /// HTTP 方法（GET、POST、PUT、DELETE…）
+    #[arg(short = 'X', long)]
+    method: Option<String>,
+    /// HTTP 標頭，可重複，例如 -H "Authorization: Bearer xxx"
+    #[arg(short = 'H', long = "header")]
+    headers: Vec<String>,
+    /// 請求內容
+    #[arg(short, long, conflicts_with = "data_file")]
+    data: Option<String>,
+    /// 從檔案讀取請求內容
+    #[arg(long)]
+    data_file: Option<PathBuf>,
+}
+
+impl HttpArgs {
+    fn build(&self, path: Option<String>) -> Result<Option<tls::HttpRequest>> {
+        let wanted = self.http
+            || path.is_some()
+            || self.method.is_some()
+            || self.data.is_some()
+            || self.data_file.is_some()
+            || !self.headers.is_empty();
+        if !wanted {
+            return Ok(None);
+        }
+        let body = match (&self.data, &self.data_file) {
+            (Some(d), _) => d.as_bytes().to_vec(),
+            (None, Some(f)) => {
+                std::fs::read(f).with_context(|| format!("無法讀取 {}", f.display()))?
+            }
+            _ => vec![],
+        };
+        let method = self.method.clone().unwrap_or_else(|| {
+            if body.is_empty() {
+                "GET".into()
+            } else {
+                "POST".into()
+            }
+        });
+        let headers = self
+            .headers
+            .iter()
+            .map(|h| tls::parse_header(h).map_err(anyhow::Error::msg))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(tls::HttpRequest {
+            method,
+            path: path.unwrap_or_else(|| "/".into()),
+            headers,
+            body,
+        }))
+    }
+}
+
 #[derive(Subcommand)]
 enum HandshakeCmd {
     /// 本機模擬：用兩組憑證庫分別扮演 Server 與 Client
@@ -147,7 +251,7 @@ enum HandshakeCmd {
         #[arg(long, env = "RUST_CA_SERVER_PASSWORD", hide_env_values = true)]
         server_password: Option<String>,
 
-        /// Client 信任庫（可多個）
+        /// Client 信任庫（可多個，.cer / .pem / .jks / .p12…）
         #[arg(long = "client-trust", required = true)]
         client_trust: Vec<PathBuf>,
         #[arg(long, env = "RUST_CA_CLIENT_TRUST_PASSWORD", hide_env_values = true)]
@@ -156,13 +260,8 @@ enum HandshakeCmd {
         /// 啟用雙向 TLS（Server 要求 Client 憑證）
         #[arg(long)]
         mtls: bool,
-        /// Client 憑證庫（mTLS 用，需含私鑰）
-        #[arg(long)]
-        client: Option<PathBuf>,
-        #[arg(long)]
-        client_alias: Option<String>,
-        #[arg(long, env = "RUST_CA_CLIENT_PASSWORD", hide_env_values = true)]
-        client_password: Option<String>,
+        #[command(flatten)]
+        client: ClientIdArgs,
         /// Server 信任庫（mTLS 用來驗證 Client 憑證）
         #[arg(long = "server-trust")]
         server_trust: Vec<PathBuf>,
@@ -174,9 +273,9 @@ enum HandshakeCmd {
     },
     /// 連到遠端 Server 測試交握
     Remote {
-        /// host[:port]，預設 443
+        /// 目標：網域 host[:port]（預設 443），或 API 網址 https://host[:port]/path
         address: String,
-        /// 信任庫檔案（可多個）；未指定時使用作業系統憑證庫
+        /// 信任庫檔案（可多個，.cer / .pem / .jks / .p12…）；未指定時使用作業系統憑證庫
         #[arg(short, long = "trust")]
         trust: Vec<PathBuf>,
         #[arg(long, env = "RUST_CA_TRUST_PASSWORD", hide_env_values = true)]
@@ -187,13 +286,10 @@ enum HandshakeCmd {
         /// 不驗證 Server 憑證，只觀察交握與憑證鏈
         #[arg(long, conflicts_with_all = ["trust", "mozilla"])]
         insecure: bool,
-        /// Client 憑證庫（mTLS 用）
-        #[arg(long)]
-        client: Option<PathBuf>,
-        #[arg(long)]
-        client_alias: Option<String>,
-        #[arg(long, env = "RUST_CA_CLIENT_PASSWORD", hide_env_values = true)]
-        client_password: Option<String>,
+        #[command(flatten)]
+        client: ClientIdArgs,
+        #[command(flatten)]
+        http: HttpArgs,
         /// 逾時秒數
         #[arg(long, default_value_t = 10)]
         timeout: u64,
@@ -318,6 +414,7 @@ fn run(cmd: Cmd, out: &Out) -> Result<u8> {
             Ok(out.expiry(&stores, days, all))
         }
         Cmd::Handshake(h) => handshake(h, out),
+        Cmd::Manage(m) => manage::run(m, out),
     }
 }
 
@@ -337,14 +434,12 @@ fn handshake(cmd: HandshakeCmd, out: &Out) -> Result<u8> {
             client_trust_password,
             mtls,
             client,
-            client_alias,
-            client_password,
             server_trust,
             server_trust_password,
             common,
         } => {
-            if mtls && client.is_none() {
-                out.warn("已啟用 --mtls 但未指定 --client：將模擬 Client 沒有憑證的情況");
+            if mtls && !client.is_set() {
+                out.warn("已啟用 --mtls 但未指定 Client 身分：將模擬 Client 沒有憑證的情況");
             }
             if mtls && server_trust.is_empty() {
                 bail!("啟用 --mtls 時必須用 --server-trust 指定 Server 用來驗證 Client 的信任庫");
@@ -359,13 +454,7 @@ fn handshake(cmd: HandshakeCmd, out: &Out) -> Result<u8> {
                 .collect::<Result<Vec<_>>>()?;
             let client_anchors = tls::trust_from_keystores(&ct_stores.iter().collect::<Vec<_>>());
 
-            let client_id = match &client {
-                Some(f) => {
-                    let ks = StoreOpener::with_password(client_password).open(f, true)?;
-                    Some(tls::identity_from_keystore(&ks, client_alias.as_deref())?)
-                }
-                None => None,
-            };
+            let client_id = client.load()?;
             let st = StoreOpener::with_password(server_trust_password);
             let st_stores = server_trust
                 .iter()
@@ -393,8 +482,7 @@ fn handshake(cmd: HandshakeCmd, out: &Out) -> Result<u8> {
             mozilla,
             insecure,
             client,
-            client_alias,
-            client_password,
+            http,
             timeout,
             proxy,
             no_proxy,
@@ -431,13 +519,9 @@ fn handshake(cmd: HandshakeCmd, out: &Out) -> Result<u8> {
             } else {
                 RemoteTrust::System
             };
-            let client_id = match &client {
-                Some(f) => {
-                    let ks = StoreOpener::with_password(client_password).open(f, true)?;
-                    Some(tls::identity_from_keystore(&ks, client_alias.as_deref())?)
-                }
-                None => None,
-            };
+            let client_id = client.load()?;
+            let target = tls::parse_target(&address).map_err(anyhow::Error::msg)?;
+            let http_req = http.build(target.path.clone())?;
             if !out.json {
                 out.info(&format!("連線至 {address} …"));
             }
@@ -450,6 +534,7 @@ fn handshake(cmd: HandshakeCmd, out: &Out) -> Result<u8> {
                     timeout: Duration::from_secs(timeout.max(1)),
                     trust: trust_mode,
                     proxy,
+                    http: http_req,
                 },
                 client_id.as_ref(),
             )
