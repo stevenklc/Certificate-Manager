@@ -10,19 +10,37 @@ use rustca_core::{Keystore, StoreFormat};
 
 use crate::widgets::{GREEN, RED, YELLOW};
 
+/// 視窗可用的最大高度：保留空間給標題列與底部按鈕，避免視窗超出畫面而關不掉。
+pub fn max_window_height(ctx: &egui::Context) -> f32 {
+    (ctx.screen_rect().height() - 60.0).max(200.0)
+}
+
+/// 底部的「關閉」按鈕（也接受 Esc）；回傳 true 表示要關閉。
+pub fn close_button(ui: &mut egui::Ui) -> bool {
+    ui.separator();
+    ui.horizontal(|ui| ui.button("關閉").clicked()).inner
+        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+}
+
 /// 顯示驗證結果；回傳 false 表示使用者關閉視窗。
 pub fn verify_window(ctx: &egui::Context, v: &Verification) -> bool {
     let mut open = true;
+    let mut close = false;
+    let max_h = max_window_height(ctx);
     egui::Window::new(format!("✅ 憑證鏈驗證：{}", v.alias))
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
         .default_width(560.0)
+        .max_height(max_h)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            verification_ui(ui, v);
+            egui::ScrollArea::vertical()
+                .max_height(max_h - 90.0)
+                .show(ui, |ui| verification_ui(ui, v));
+            close = close_button(ui);
         });
-    open
+    open && !close
 }
 
 pub fn verification_ui(ui: &mut egui::Ui, v: &Verification) {
@@ -118,13 +136,16 @@ impl JavaTest {
     pub fn ui(&mut self, ctx: &egui::Context) -> bool {
         self.poll();
         let mut open = true;
+        let mut close = false;
         let mut rerun = false;
+        let max_h = max_window_height(ctx);
         egui::Window::new(format!("☕ Java 相容性測試：{}", self.ks.name()))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
             .default_width(680.0)
             .default_height(480.0)
+            .max_height(max_h)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(match &self.file {
@@ -162,9 +183,14 @@ impl JavaTest {
                         ui.spinner();
                         ui.label("搜尋 Java 並測試中…");
                     });
+                    close = close_button(ui);
                     return;
                 }
-                match &self.result {
+                // 結果與提示全部放進捲動區，底部的「關閉」永遠看得到
+                egui::ScrollArea::vertical()
+                    .max_height((max_h - 190.0).max(120.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| match &self.result {
                     None => {}
                     Some(Err(e)) => {
                         ui.colored_label(RED, format!("✘ {e}"));
@@ -172,7 +198,7 @@ impl JavaTest {
                     }
                     Some(Ok((runtimes, rep))) => {
                         ui.label(format!("找到 {} 個 Java 版本", runtimes.len()));
-                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        {
                             egui::Grid::new("java_results")
                                 .num_columns(3)
                                 .striped(true)
@@ -208,22 +234,30 @@ impl JavaTest {
                                         ui.end_row();
                                     }
                                 });
-                        });
+                        }
                         ui.add_space(4.0);
                         if rep.ok {
                             ui.label(RichText::new("✔ 所有 Java 版本都能使用").color(GREEN).strong());
                         } else {
                             ui.label(RichText::new("✘ 部分 Java 版本無法使用").color(RED).strong());
                         }
-                        for n in &rep.notes {
-                            ui.add(egui::Label::new(format!("ℹ {n}")).wrap());
+                        if !rep.notes.is_empty() {
+                            ui.add_space(4.0);
+                            egui::CollapsingHeader::new(format!("ℹ 注意事項（{} 項）", rep.notes.len()))
+                                .default_open(rep.notes.len() <= 5)
+                                .show(ui, |ui| {
+                                    for n in &rep.notes {
+                                        ui.add(egui::Label::new(format!("ℹ {n}")).wrap());
+                                    }
+                                });
                         }
                     }
-                }
+                });
+                close = close_button(ui);
             });
         if rerun && self.running.is_none() {
             self.start(ctx);
         }
-        open
+        open && !close
     }
 }

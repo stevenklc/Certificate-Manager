@@ -845,12 +845,18 @@ pub fn show(d: &mut Dialog, ctx: &egui::Context, stores: &[Keystore]) -> Option<
     let mut ok_label = "確定";
     // 破壞性動作不接受 Enter 快速確認
     let enter_ok = !matches!(d.kind, Kind::Delete { .. } | Kind::ConfirmClose { .. });
+    let max_h = crate::tools::max_window_height(ctx);
     egui::Window::new(title(&d.kind))
         .collapsible(false)
         .resizable(false)
+        .max_height(max_h)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             let store_name = |i: &usize| stores.get(*i).map(|s| s.name()).unwrap_or_default();
+            // 欄位多時（如製作憑證鏈）可捲動，底部的確定 / 取消永遠看得到
+            egui::ScrollArea::vertical()
+                .max_height((max_h - 110.0).max(120.0))
+                .show(ui, |ui| {
             egui::Grid::new("manage_form")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -1113,6 +1119,7 @@ pub fn show(d: &mut Dialog, ctx: &egui::Context, stores: &[Keystore]) -> Option<
                         ui.end_row();
                         ok_label = "不儲存，直接關閉";
                     }
+                });
                 });
             if let Some(e) = &d.error {
                 ui.add_space(4.0);
