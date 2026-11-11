@@ -221,3 +221,21 @@ scripts/         產生測試用憑證庫的腳本
 - Java 相容性測試需要本機已安裝 Java；只會測試找得到的版本
 - TLS 模擬使用 rustls，只支援 TLS 1.2／1.3。它比 Java／OpenSSL 嚴格，例如不接受 SHA-1 簽章，也不接受 Java 8 keytool 產生的帶 NULL 參數的 ECDSA 憑證。遇到這類情況，診斷訊息會特別說明
 - proxy 只支援 HTTP CONNECT（Basic 認證），不支援 NTLM / Kerberos。沒有指定 `--proxy` 時，會依序使用 `HTTPS_PROXY` / `NO_PROXY`、Windows 系統 proxy 設定（含 ProxyOverride 例外清單）
+
+## 授權
+
+本專案採用雙授權，您可以任選其一：
+
+- [MIT License](LICENSE-MIT)
+- [Apache License 2.0](LICENSE-APACHE)
+
+除非您另外明確聲明，您有意提交到本專案的任何貢獻，依 Apache-2.0 授權的定義，都會依上述雙授權釋出，不附加其他條款或條件。
+
+### 第三方元件
+
+所有相依套件都採用寬鬆授權（MIT、Apache-2.0、BSD、ISC、Zlib、Unicode-3.0、BSL-1.0、CC0 等）。發佈編譯好的執行檔時，請一併附上相依套件的授權聲明，其中需要特別注意：
+
+- `webpki-roots`（內建的 Mozilla 根憑證清單）：CDLA-Permissive-2.0
+- `epaint_default_fonts`（GUI 內嵌的預設字型）：除 MIT / Apache-2.0 外，字型本身另有 SIL Open Font License 1.1 與 Ubuntu Font Licence 1.0
+
+可以用 [cargo-about](https://github.com/EmbarkStudios/cargo-about) 或 `cargo license` 產生完整的第三方授權清單。

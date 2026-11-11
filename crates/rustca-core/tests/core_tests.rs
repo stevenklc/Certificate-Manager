@@ -550,7 +550,9 @@ fn windows_proxy_settings_parsing() {
     let ov = "*.corp.example;10.*;Fileserver;build*.dev.example;<local>";
     assert!(tls::windows_bypass_match("api.corp.example", ov));
     assert!(tls::windows_bypass_match("10.1.2.3", ov));
+    // 不分大小寫
     assert!(tls::windows_bypass_match("FILESERVER", ov));
+    // 前綴萬用字元
     assert!(tls::windows_bypass_match("build01.dev.example", ov));
     assert!(tls::windows_bypass_match("intranet", ov)); // <local>
     assert!(!tls::windows_bypass_match("www.google.com", ov));
