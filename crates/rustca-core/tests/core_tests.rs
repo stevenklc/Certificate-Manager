@@ -399,6 +399,8 @@ fn remote_handshake_against_local_server() {
     assert!(r.success, "{:?}", r.failure);
     assert_eq!(r.server_chain.len(), 2);
     assert_eq!(r.protocol.as_deref(), Some("TLS 1.3"));
+    // 沒經過 proxy：不判定為 TLS 檢查（內部 CA 很常見）
+    assert!(r.interception.is_none());
 
     // 用錯誤信任庫：失敗，但仍取得 Server 憑證鏈
     let other = CertInfo::from_der(&p.other_root.der()).unwrap();
@@ -538,6 +540,13 @@ fn remote_via_http_connect_proxy() {
         r.via_proxy.as_deref(),
         Some(format!("http://***@127.0.0.1:{proxy_port}").as_str())
     );
+    // 經由 proxy 且憑證鏈連不到公開根憑證 → 提醒可能被 TLS 檢查換掉，且不洩漏 proxy 帳密
+    let i = r.interception.as_deref().expect("應偵測到非公開 CA");
+    assert!(i.contains("不是 Server 的真實憑證鏈"), "{i}");
+    assert!(i.contains(&format!("http://***@127.0.0.1:{proxy_port}")));
+    let txt = r.to_text(true);
+    assert!(txt.contains("這不是 Server 的真實憑證鏈"));
+    assert!(!txt.contains("p%40ss") && !txt.contains("user:"));
     t1.join().unwrap();
     drop(t2);
 }

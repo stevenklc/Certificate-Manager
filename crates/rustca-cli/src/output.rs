@@ -483,6 +483,16 @@ impl Out {
             "{}",
             self.paint(&format!("═══ TLS 交握（{mode}）═══"), BOLD)
         );
+        if let Some(i) = &r.interception {
+            println!(
+                "{}",
+                self.paint("⚠ 注意：這不是 Server 的真實憑證鏈", YELLOW)
+            );
+            for l in i.lines() {
+                println!("  {}", self.paint(l, YELLOW));
+            }
+            println!();
+        }
         println!("  目標：{}", r.target);
         println!("  SNI / 驗證名稱：{}", r.server_name);
         if let Some(p) = &r.via_proxy {

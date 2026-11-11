@@ -71,7 +71,7 @@ const TERMS: &[(&str, Items)] = &[
             ("金鑰用途（Key Usage）", "限制金鑰能做什麼，例如 Digital Signature、Key Encipherment、Key Cert Sign（只有 CA 會有）。TLS 憑證至少要有 Digital Signature（RSA 也可用 Key Encipherment）。"),
             ("SNI", "Client 在交握時告訴 Server 要連的主機名稱，讓同一個 IP 上的多個網站送出各自的憑證。"),
             ("主機名稱驗證", "Client 檢查 Server 憑證的 SAN 是否涵蓋它要連的名稱，不符就拒絕（即使憑證鏈完全正確）。"),
-            ("TLS 檢查（企業 Proxy）", "公司 Proxy 可能用公司自己的 CA 重新簽發外部網站的憑證。只用 Java cacerts 驗證會失敗（UnknownIssuer），要加入公司的根 CA 或使用系統憑證庫。"),
+            ("TLS 檢查（企業 Proxy）", "公司 Proxy 可能用公司自己的 CA 重新簽發外部網站的憑證，這時看到的不是 Server 的真實憑證鏈（結果上方會出現黃色提醒）。只用 Java cacerts 驗證會失敗（UnknownIssuer），要加入公司的根 CA 或使用系統憑證庫。要判斷另一台主機（走不同 proxy）能否交握，請在那台主機上執行 Linux 版 rust-ca。"),
         ],
     ),
 ];

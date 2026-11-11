@@ -753,6 +753,22 @@ fn copy_bar(ui: &mut egui::Ui, r: &HandshakeReport, copied_at: &mut Option<f64>)
 }
 
 fn report_ui(ui: &mut egui::Ui, r: &HandshakeReport) {
+    if let Some(i) = &r.interception {
+        egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(2.0_f32, YELLOW))
+            .fill(YELLOW.gamma_multiply(0.12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("⚠ 注意：這不是 Server 的真實憑證鏈（疑似 proxy TLS 檢查）")
+                        .color(YELLOW)
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add(egui::Label::new(i.as_str()).wrap().selectable(true));
+            });
+        ui.add_space(6.0);
+    }
     if r.success {
         ui.label(RichText::new("✔ 交握成功").color(GREEN).size(20.0).strong());
     } else {

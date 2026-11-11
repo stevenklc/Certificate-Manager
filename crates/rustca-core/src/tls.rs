@@ -289,6 +289,9 @@ pub struct HandshakeReport {
     pub trust_anchor_count: usize,
     /// 經由的 proxy（不含帳密）
     pub via_proxy: Option<String>,
+    /// 經由 proxy 時，收到的憑證鏈連不到公開根憑證：極可能被 proxy 的 TLS 檢查換掉，
+    /// 不是 Server 的真實憑證鏈（內容為給使用者的說明）
+    pub interception: Option<String>,
     /// HTTP 請求結果（有送出請求時）
     pub http: Option<HttpResponse>,
     pub failure: Option<Failure>,
@@ -336,6 +339,37 @@ impl TimeProvider for SimTime {
             Some(ts) if ts >= 0 => Some(UnixTime::since_unix_epoch(Duration::from_secs(ts as u64))),
             _ => Some(UnixTime::now()),
         }
+    }
+}
+
+/// 憑證鏈能否連到 Mozilla 公開根憑證（用來判斷是否被 proxy 的 TLS 檢查換掉）。
+/// 只看簽發者是否可信，名稱與到期以外的錯誤（例如過期）不算「不是公開 CA」。
+fn chains_to_public_root(
+    chain: &[Vec<u8>],
+    sn: &ServerName<'static>,
+    at: Option<i64>,
+    provider: &Arc<CryptoProvider>,
+) -> bool {
+    let Some((ee, rest)) = chain.split_first() else {
+        return true;
+    };
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let Ok(v) = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build()
+    else {
+        return true;
+    };
+    let ee = CertificateDer::from(ee.clone());
+    let inter: Vec<CertificateDer> = rest.iter().map(|c| CertificateDer::from(c.clone())).collect();
+    let now = SimTime(at).current_time().unwrap_or_else(UnixTime::now);
+    match v.verify_server_cert(&ee, &inter, sn, &[], now) {
+        Ok(_) => true,
+        Err(rustls::Error::InvalidCertificate(e)) => !matches!(
+            e,
+            rustls::CertificateError::UnknownIssuer
+                | rustls::CertificateError::BadSignature
+        ),
+        Err(_) => true,
     }
 }
 
@@ -1009,6 +1043,13 @@ impl HandshakeReport {
             "✘ 交握失敗".to_string()
         };
         let _ = writeln!(s, "結果：{result}");
+        if let Some(i) = &self.interception {
+            let _ = writeln!(s, "\n⚠ 注意：這不是 Server 的真實憑證鏈");
+            for l in i.lines() {
+                let _ = writeln!(s, "  {l}");
+            }
+            let _ = writeln!(s);
+        }
         if let Some(f) = &self.failure {
             let _ = writeln!(s, "錯誤：{}", f.message);
             if !f.hint.is_empty() {
@@ -1882,7 +1923,7 @@ pub fn connect_remote(opts: &RemoteOptions, client: Option<&Identity>) -> Handsh
     let _ = sock.set_read_timeout(Some(opts.timeout));
     let _ = sock.set_write_timeout(Some(opts.timeout));
 
-    let mut conn = match ClientConnection::new(Arc::new(cfg), sn) {
+    let mut conn = match ClientConnection::new(Arc::new(cfg), sn.clone()) {
         Ok(c) => c,
         Err(e) => {
             report.fail(Side::Client, &e);
@@ -1962,15 +2003,26 @@ pub fn connect_remote(opts: &RemoteOptions, client: Option<&Identity>) -> Handsh
     let mut w = Vec::new();
     report.server_chain = parse_chain(&chain, &mut w);
     report.warnings.extend(w);
-    if report.via_proxy.is_some() {
-        if let (Some(f), Some(top)) = (report.failure.as_mut(), report.server_chain.last()) {
-            if f.message.contains("UnknownIssuer") {
-                f.hint.push_str(&format!(
-                    "\n目前經由 proxy 連線：企業 proxy 可能進行 TLS 檢查（SSL inspection），以自家 CA 重新簽發憑證。\n\
-                     收到的憑證鏈頂端簽發者：{}\n\
-                     若此為企業 CA，請改用系統信任庫（不加 --mozilla / -t），或把該 CA 加入信任庫；也可用 --no-proxy 直連比較。",
-                    top.issuer
-                ));
+    if let (Some(p), Some(top)) = (report.via_proxy.clone(), report.server_chain.last()) {
+        if !chains_to_public_root(&chain, &sn, opts.at, &provider) {
+            let top_issuer = top.issuer.clone();
+            report.interception = Some(format!(
+                "收到的憑證鏈連不到任何公開根憑證（Mozilla 根憑證清單），頂端簽發者是：\n  {top_issuer}\n\
+                 目前經由 proxy（{p}）連線，極可能是 proxy 進行 TLS 檢查（SSL inspection），以自家 CA 重新簽發了憑證。\n\
+                 這不是 Server 的真實憑證鏈；交握結果只代表「這台電腦經由這個 proxy」的情況，\
+                 不能用來判斷其他主機（例如走不同 proxy 的伺服器）或其信任庫能否與 Server 交握。\n\
+                 要查看真實狀況，請在實際要連線的主機上執行 rust-ca（Linux 版 CLI），並使用該主機的 proxy，例如：\n  \
+                 rust-ca handshake remote {} -t <信任庫> --proxy http://<該主機的 proxy>:<port>",
+                report.target
+            ));
+            if let Some(f) = report.failure.as_mut() {
+                if f.message.contains("UnknownIssuer") {
+                    f.hint.push_str(&format!(
+                        "\n收到的憑證鏈頂端簽發者是「{top_issuer}」，不是公開 CA：憑證可能被 proxy 的 TLS 檢查換掉（見上方說明）。\n\
+                         若只想確認這台電腦能否經由 proxy 連線，請改用系統信任庫（不加 --mozilla / -t）；\
+                         若要確認信任庫與 Server 真實憑證是否相容，請在實際主機上測試。"
+                    ));
+                }
             }
         }
     }

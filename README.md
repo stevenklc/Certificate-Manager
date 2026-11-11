@@ -25,6 +25,8 @@
   - 逐筆列出交握訊息（ClientHello、Certificate、Alert…）
   - 失敗時以中文說明原因與建議，例如缺根 CA、主機名稱不符 SAN、EKU 不符、Client 憑證不被信任、企業 proxy 進行 TLS 檢查
   - 支援 HTTP CONNECT proxy（含帳密），自動讀取 `HTTPS_PROXY` / `NO_PROXY` 與 Windows 系統 proxy 設定
+  - 經由 proxy 時，若收到的憑證鏈連不到公開根憑證（Mozilla 清單），會醒目標示「這不是 Server 的真實憑證鏈」：企業 proxy 的 TLS 檢查會以自家 CA 重新簽發憑證，這時的結果只代表「這台電腦經由這個 proxy」，要判斷其他主機的信任庫請在該主機上執行 Linux 版 CLI
+  - 交握結果可複製成純文字（結果、診斷、交握訊息、憑證鏈，可附 PEM），proxy 帳密與敏感標頭會遮蔽
   - 遠端目標可以是網域（`host:port`），也可以是 API 網址（`https://host/api/...`）；交握成功後可送出 HTTP 請求（方法、標頭、Body），顯示狀態碼、回應標頭與內容，`Authorization`、Cookie 等敏感標頭會遮蔽
   - Client / Server 身分可以用憑證庫（.jks / .p12），也可以用「憑證檔 + 私鑰檔」（.cer / .crt / .pem + .key）
 - **憑證庫管理**（JKS、JCEKS、PKCS#12）
