@@ -254,18 +254,40 @@ pub fn issuance_tree(chain: &BuiltChain, pool: &[&CertInfo]) -> IssuanceTree {
     }
 
     let mut visited = HashSet::new();
-    // (憑證, 深度, 父節點索引, 簽章)
-    let mut stack: Vec<(&CertInfo, usize, Option<usize>, Option<bool>)> = vec![(
+    let top_sig = top.signature_ok.filter(|_| top.cert.self_signed);
+    grow(
+        &mut tree,
         &top.cert,
-        0,
-        None,
-        top.signature_ok.filter(|_| top.cert.self_signed),
-    )];
+        top_sig,
+        &all,
+        &path,
+        Some(target),
+        &mut visited,
+        MAX_TREE_NODES,
+    );
+    tree
+}
+
+/// 從 `top` 往下（前序）加入所有由它（間接）簽發的憑證。
+#[allow(clippy::too_many_arguments)]
+fn grow<'a>(
+    tree: &mut IssuanceTree,
+    top: &'a CertInfo,
+    top_sig: Option<bool>,
+    all: &[&'a CertInfo],
+    path: &HashSet<&str>,
+    target: Option<&str>,
+    visited: &mut HashSet<&'a str>,
+    max_nodes: usize,
+) {
+    // (憑證, 深度, 父節點索引, 簽章)
+    let mut stack: Vec<(&CertInfo, usize, Option<usize>, Option<bool>)> =
+        vec![(top, 0, None, top_sig)];
     while let Some((cert, depth, parent, sig)) = stack.pop() {
         if !visited.insert(cert.sha256.as_str()) {
             continue;
         }
-        if tree.nodes.len() >= MAX_TREE_NODES {
+        if tree.nodes.len() >= max_nodes {
             tree.truncated = true;
             break;
         }
@@ -276,7 +298,7 @@ pub fn issuance_tree(chain: &BuiltChain, pool: &[&CertInfo]) -> IssuanceTree {
             parent,
             signature_ok: sig,
             on_path: path.contains(cert.sha256.as_str()),
-            is_target: &cert.sha256 == target,
+            is_target: target == Some(cert.sha256.as_str()),
         });
         if depth >= MAX_DEPTH {
             continue;
@@ -304,5 +326,48 @@ pub fn issuance_tree(chain: &BuiltChain, pool: &[&CertInfo]) -> IssuanceTree {
             stack.push((c, depth + 1, Some(idx), sig));
         }
     }
+}
+
+/// 整批憑證的簽發關係（可能有多棵樹）：最上層為自簽根憑證，
+/// 或在 `pool` 中找不到簽發者的憑證；`target`（sha256）會被標示。
+pub fn issuance_forest(pool: &[&CertInfo], target: Option<&str>) -> IssuanceTree {
+    let mut tree = IssuanceTree {
+        nodes: vec![],
+        missing_issuer: None,
+        truncated: false,
+    };
+    let mut seen = HashSet::new();
+    let all: Vec<&CertInfo> = pool
+        .iter()
+        .copied()
+        .filter(|c| seen.insert(c.sha256.as_str()))
+        .collect();
+    let mut tops: Vec<&CertInfo> = all
+        .iter()
+        .copied()
+        .filter(|c| c.self_signed || !all.iter().any(|p| p.sha256 != c.sha256 && issued_by(c, p)))
+        .collect();
+    // 根憑證在前，其次依名稱
+    tops.sort_by_key(|c| (!c.self_signed, c.display_name().to_lowercase()));
+    let path = HashSet::new();
+    let mut visited = HashSet::new();
+    for top in tops {
+        let sig = top.self_signed.then(|| top.verify_signed_by(top)).flatten();
+        grow(
+            &mut tree,
+            top,
+            sig,
+            &all,
+            &path,
+            target,
+            &mut visited,
+            MAX_FOREST_NODES,
+        );
+        if tree.truncated {
+            break;
+        }
+    }
     tree
 }
+
+const MAX_FOREST_NODES: usize = 3000;

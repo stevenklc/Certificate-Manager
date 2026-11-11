@@ -114,3 +114,15 @@ pub fn pick_cert_file() -> Option<PathBuf> {
         .add_filter("所有檔案", &["*"])
         .pick_file()
 }
+
+/// 最多 `max_w` 寬的單行文字，過長以「…」截斷，滑鼠移上去顯示完整內容。
+pub fn trunc_label(ui: &mut egui::Ui, text: impl Into<RichText>, max_w: f32) -> egui::Response {
+    let text: RichText = text.into();
+    let full = text.text().to_string();
+    ui.scope(|ui| {
+        ui.set_max_width(max_w);
+        ui.add(egui::Label::new(text).truncate())
+    })
+    .inner
+    .on_hover_text(full)
+}

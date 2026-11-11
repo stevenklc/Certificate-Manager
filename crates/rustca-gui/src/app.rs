@@ -6,8 +6,9 @@ use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use rustca_core::chain::LinkSource;
 use rustca_core::{
-    build_chain, edit, format_ts, issuance_tree, load_file, now_ts, BuiltChain, CertInfo, ChainEnd,
-    EntryKind, IssuanceTree, KeyState, Keystore, LoadOptions, Matcher, StoreFormat,
+    build_chain, edit, format_ts, issuance_forest, issuance_tree, load_file, now_ts, BuiltChain,
+    CertInfo, ChainEnd, EntryKind, IssuanceTree, KeyState, Keystore, LoadOptions, Matcher,
+    StoreFormat,
 };
 
 use crate::handshake::HandshakeState;
@@ -64,6 +65,8 @@ pub struct App {
     verify_view: Option<Verification>,
     java_test: Option<JavaTest>,
     role_check: Option<RoleCheck>,
+    graph_view: Option<GraphView>,
+    help: Option<crate::help::Help>,
 }
 
 impl App {
@@ -93,6 +96,8 @@ impl App {
             verify_view: None,
             java_test: None,
             role_check: None,
+            graph_view: None,
+            help: None,
         }
     }
 
@@ -191,6 +196,195 @@ impl App {
         self.selected_entry = None;
         self.chain_cache = None;
         self.hs.on_stores_changed(self.stores.len());
+    }
+
+    /// 大畫面簽發關係圖視窗。
+    fn graph_window(&mut self, ctx: &egui::Context) {
+        let Some(mut g) = self.graph_view.take() else {
+            return;
+        };
+        if g.store >= self.stores.len() {
+            return;
+        }
+        // 目前條目（需在範圍內）
+        let center = self.selected_entry.filter(|(s, e)| {
+            (g.all_files || *s == g.store) && self.stores[*s].entries.get(*e).is_some()
+        });
+        let key = (
+            g.whole || center.is_none(),
+            g.all_files,
+            center,
+            self.stores.len(),
+            self.stores[g.store].entries.len(),
+        );
+        if g.key != Some(key) || g.dirty {
+            let pool: Vec<&CertInfo> = if g.all_files {
+                self.pool()
+            } else {
+                let mut seen = std::collections::HashSet::new();
+                self.stores[g.store]
+                    .all_certs()
+                    .into_iter()
+                    .filter(|c| seen.insert(c.sha256.clone()))
+                    .collect()
+            };
+            let target = center.and_then(|(s, e)| self.stores[s].entries[e].leaf());
+            g.tree = match center {
+                Some((s, e)) if !g.whole => {
+                    let built = build_chain(
+                        &self.stores[s].entries[e].chain,
+                        &pool,
+                        now_ts(),
+                        self.warn_days,
+                    );
+                    issuance_tree(&built, &pool)
+                }
+                _ => issuance_forest(&pool, target.map(|c| c.sha256.as_str())),
+            };
+            g.selected = g.tree.nodes.iter().position(|n| n.is_target).unwrap_or(0);
+            g.scroll = Some(g.selected);
+            g.key = Some(key);
+            g.dirty = false;
+        }
+
+        let screen = ctx.screen_rect();
+        let size = egui::vec2(screen.width() * 0.94, screen.height() * 0.88);
+        let locations = self.locations();
+        let mut open = true;
+        let mut close = false;
+        let mut goto = None;
+        let mut menu_act = None;
+        let stores = &self.stores;
+        let title = if g.all_files {
+            "所有已開啟的檔案".to_string()
+        } else {
+            stores[g.store].name()
+        };
+        egui::Window::new(format!("🌳 簽發關係圖：{title}"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(size)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("顯示：");
+                    ui.add_enabled_ui(center.is_some(), |ui| {
+                        ui.radio_value(&mut g.whole, false, "目前條目的簽發關係")
+                            .on_disabled_hover_text("請先在清單中選取一個條目");
+                    });
+                    ui.radio_value(&mut g.whole, true, "全部憑證");
+                    ui.separator();
+                    ui.checkbox(&mut g.all_files, "包含所有已開啟的檔案");
+                    if ui.button("🔄 重新整理").clicked() {
+                        g.dirty = true;
+                    }
+                    ui.separator();
+                    let tops = g.tree.nodes.iter().filter(|n| n.parent.is_none()).count();
+                    ui.weak(format!("{} 張憑證、{tops} 棵樹", g.tree.nodes.len()));
+                });
+                if let Some(m) = &g.tree.missing_issuer {
+                    ui.colored_label(RED, format!("✘ 最上層憑證的簽發者不在範圍內：{m}"));
+                }
+                if g.tree.truncated {
+                    ui.colored_label(YELLOW, "⚠ 憑證太多，只顯示一部分");
+                }
+                egui::TopBottomPanel::bottom("big_tree_bottom")
+                    .show_separator_line(true)
+                    .show_inside(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("關閉").clicked() {
+                                close = true;
+                            }
+                            ui.weak("點一下看內容 · 點兩下跳到所在條目 · 右鍵管理 · 線條：綠＝簽章正確、紅＝失敗、灰＝無法判斷");
+                        });
+                    });
+                // 右：選取憑證的內容
+                egui::SidePanel::right("big_tree_cert_panel")
+                    .resizable(true)
+                    .default_width(size.x * 0.36)
+                    .min_width(260.0)
+                    .max_width(size.x * 0.6)
+                    .show_inside(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("big_tree_cert")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let Some(n) = g.tree.nodes.get(g.selected) else {
+                                    ui.weak("點選左側的憑證查看內容");
+                                    return;
+                                };
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.strong(n.cert.display_name());
+                                    if let Some(loc) = self.find_cert(&n.cert.sha256, g.store) {
+                                        if ui
+                                            .button("➡ 前往此條目")
+                                            .on_hover_text("在主畫面清單中選取這張憑證所在的條目")
+                                            .clicked()
+                                        {
+                                            goto = Some(loc);
+                                        }
+                                    }
+                                });
+                                if let Some(v) = locations.get(&n.cert.sha256) {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!("位置：{}", v.join("、"))).weak(),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                cert_grid(
+                                    ui,
+                                    "big_tree_grid",
+                                    &n.cert,
+                                    n.cert.status_at(now_ts(), self.warn_days),
+                                );
+                            });
+                    });
+                // 左：關係圖
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    egui::ScrollArea::both()
+                        .id_salt("big_tree")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let prefer = center.map_or(g.store, |(s, _)| s);
+                            let find = |sha: &str| self.find_cert(sha, prefer);
+                            let tree = &g.tree;
+                            let r = crate::graph::tree_ui(
+                                ui,
+                                tree,
+                                g.selected,
+                                &locations,
+                                self.warn_days,
+                                g.scroll.take(),
+                                &mut |ui, i| {
+                                    let loc = find(&tree.nodes[i].cert.sha256);
+                                    entry_menu(ui, stores, loc, &mut menu_act);
+                                },
+                            );
+                            if let Some(i) = r.clicked {
+                                g.selected = i;
+                            }
+                            if let Some(i) = r.double_clicked {
+                                goto = find(&tree.nodes[i].cert.sha256);
+                            }
+                        });
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if let Some(loc) = goto {
+            self.jump_to(loc);
+        }
+        if let Some((s, e, a)) = menu_act {
+            self.entry_act(s, e, a);
+        }
+        if open && !close {
+            self.graph_view = Some(g);
+        }
     }
 
     /// 每張憑證（sha256）出現在哪些「檔案 / 別名」。
@@ -293,6 +487,17 @@ impl App {
                             .suffix(" 天"),
                     );
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(RichText::new("❓ 說明").strong())
+                        .on_hover_text(
+                            "名詞解釋（Client / Server / Truststore / clientAuth…）與功能介紹",
+                        )
+                        .clicked()
+                    {
+                        self.help = Some(crate::help::Help::default());
+                    }
+                });
             });
             ui.add_space(4.0);
         });
@@ -836,6 +1041,7 @@ impl App {
                                     self.tree_selected,
                                     &locations,
                                     self.warn_days,
+                                    None,
                                     &mut |ui, i| {
                                         let loc = find(&tree.nodes[i].cert.sha256);
                                         entry_menu(ui, stores, loc, &mut menu_act);
@@ -1128,6 +1334,7 @@ impl App {
         let mut save = false;
         let mut java = false;
         let mut role = false;
+        let mut graph = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!("🛠 {}", ks.name()));
             if !writable {
@@ -1230,6 +1437,13 @@ impl App {
                 java = true;
             }
             if ui
+                .add_enabled(!ks.entries.is_empty(), egui::Button::new("🌳 簽發關係圖"))
+                .on_hover_text("以大畫面檢視誰簽發了誰（目前條目，或整個憑證庫）")
+                .clicked()
+            {
+                graph = true;
+            }
+            if ui
                 .button("☑ 用途檢查")
                 .on_hover_text(
                     "檢查是否適合當 Server keystore、Client keystore（mTLS）或 Truststore",
@@ -1258,6 +1472,9 @@ impl App {
                 }
                 Err(e) => self.error(e),
             }
+        }
+        if graph {
+            self.graph_view = Some(GraphView::new(si, self.selected_entry.is_none()));
         }
         if role {
             self.role_check = Some(RoleCheck::new(self.stores[si].clone()));
@@ -1328,9 +1545,10 @@ impl App {
         egui::Window::new("🔐 需要密碼")
             .collapsible(false)
             .resizable(false)
+            .max_width(crate::tools::max_window_width(ctx))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!("檔案：{}", p.path.display()));
+                crate::widgets::trunc_label(ui, format!("檔案：{}", p.path.display()), 460.0);
                 ui.add_space(4.0);
                 egui::Grid::new("pw").num_columns(2).show(ui, |ui| {
                     ui.label("憑證庫密碼");
@@ -1416,6 +1634,12 @@ impl eframe::App for App {
                         .unwrap_or(0);
                     self.selected_entry = Some((0, first));
                     match shot.tab.as_str() {
+                        "help" => {
+                            self.help = Some(crate::help::Help::default());
+                        }
+                        "graph" => {
+                            self.graph_view = Some(GraphView::new(0, true));
+                        }
                         "role" => {
                             self.role_check = Some(RoleCheck::new(self.stores[0].clone()));
                         }
@@ -1534,6 +1758,12 @@ impl eframe::App for App {
         if let Some(v) = &self.verify_view {
             if !verify_window(ctx, v) {
                 self.verify_view = None;
+            }
+        }
+        self.graph_window(ctx);
+        if let Some(h) = self.help.as_mut() {
+            if !h.ui(ctx) {
+                self.help = None;
             }
         }
         if let Some(r) = self.role_check.as_mut() {
@@ -1681,4 +1911,40 @@ enum SortCol {
     Status,
     Key,
     Matched,
+}
+
+/// 關係圖快取鍵：(全部, 所有檔案, 中心條目, 檔案數, 條目數)
+type GraphKey = (bool, bool, Option<(usize, usize)>, usize, usize);
+
+/// 大畫面簽發關係圖的狀態。
+struct GraphView {
+    store: usize,
+    /// true＝全部憑證；false＝以目前條目為中心
+    whole: bool,
+    all_files: bool,
+    selected: usize,
+    tree: IssuanceTree,
+    key: Option<GraphKey>,
+    dirty: bool,
+    /// 下一個 frame 要捲動到的節點
+    scroll: Option<usize>,
+}
+
+impl GraphView {
+    fn new(store: usize, whole: bool) -> Self {
+        GraphView {
+            store,
+            whole,
+            all_files: false,
+            selected: 0,
+            tree: IssuanceTree {
+                nodes: vec![],
+                missing_issuer: None,
+                truncated: false,
+            },
+            key: None,
+            dirty: true,
+            scroll: None,
+        }
+    }
 }

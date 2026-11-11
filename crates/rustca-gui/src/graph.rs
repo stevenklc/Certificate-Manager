@@ -32,6 +32,7 @@ pub fn tree_ui(
     selected: usize,
     locations: &Locations,
     warn_days: i64,
+    scroll_to: Option<usize>,
     menu: &mut dyn FnMut(&mut egui::Ui, usize),
 ) -> TreeResponse {
     let now = now_ts();
@@ -86,6 +87,9 @@ pub fn tree_ui(
     for (i, n) in tree.nodes.iter().enumerate() {
         let r = rect_of(i);
         let resp = ui.interact(r, ui.id().with(("tree_node", i)), Sense::click());
+        if scroll_to == Some(i) {
+            ui.scroll_to_rect(r, Some(egui::Align::Center));
+        }
         let status = n.cert.status_at(now, warn_days);
         let fill = if i == selected {
             visuals.selection.bg_fill.gamma_multiply(0.55)

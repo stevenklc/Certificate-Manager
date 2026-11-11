@@ -10,7 +10,7 @@ use rustca_core::{
     StoreFormat,
 };
 
-use crate::widgets::{pick_cert_file, pick_cert_files, GREEN, RED, YELLOW};
+use crate::widgets::{pick_cert_file, pick_cert_files, trunc_label, GREEN, RED, YELLOW};
 
 const MIN_PW: usize = 6;
 
@@ -268,7 +268,7 @@ fn assembly_ui(ui: &mut egui::Ui, label: &str, a: &mut Assembly) {
                             .on_hover_text("找不到上層 CA，憑證鏈不完整；可再加入 CA 的 .cer");
                     }
                     cert_cell(ui, &k.chain[0], now);
-                    ui.weak(&k.source);
+                    trunc_label(ui, RichText::new(&k.source).weak(), 260.0);
                     ui.end_row();
                 }
                 for c in a.plan.certs.iter_mut() {
@@ -276,7 +276,7 @@ fn assembly_ui(ui: &mut egui::Ui, label: &str, a: &mut Assembly) {
                     ui.add_sized([170.0, 20.0], egui::TextEdit::singleline(&mut c.alias));
                     ui.label(format!("信任憑證 · {}", c.cert.role()));
                     cert_cell(ui, &c.cert, now);
-                    ui.weak(&c.source);
+                    trunc_label(ui, RichText::new(&c.source).weak(), 260.0);
                     ui.end_row();
                 }
             });
@@ -301,7 +301,7 @@ fn cert_cell(ui: &mut egui::Ui, c: &CertInfo, now: i64) {
             .collect::<String>()
     );
     let color = crate::widgets::status_color(st);
-    ui.colored_label(color, text).on_hover_text(format!(
+    trunc_label(ui, RichText::new(text).color(color), 300.0).on_hover_text(format!(
         "主體：{}\n簽發者：{}\n{}",
         c.subject,
         c.issuer,
@@ -990,7 +990,7 @@ fn file_field(ui: &mut egui::Ui, label: &str, v: &mut Option<PathBuf>) -> bool {
             }
         }
         match v {
-            Some(p) => ui.label(p.display().to_string()),
+            Some(p) => trunc_label(ui, p.display().to_string(), 420.0),
             None => ui.weak("（未選擇）"),
         };
     });
@@ -1024,7 +1024,7 @@ fn save_field(
             }
         }
         match v {
-            Some(p) => ui.label(p.display().to_string()),
+            Some(p) => trunc_label(ui, p.display().to_string(), 420.0),
             None => ui.weak("（未選擇）"),
         };
     });
@@ -1081,12 +1081,15 @@ pub fn show(d: &mut Dialog, ctx: &egui::Context, stores: &[Keystore]) -> Option<
         .collapsible(false)
         .resizable(false)
         .max_height(max_h)
+        .max_width(crate::tools::max_window_width(ctx))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             let store_name = |i: &usize| stores.get(*i).map(|s| s.name()).unwrap_or_default();
             // 欄位多時（如製作憑證鏈）可捲動，底部的確定 / 取消永遠看得到
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .max_height((max_h - 110.0).max(120.0))
+                // 螢幕放得下就完整顯示，放不下才出現水平捲軸
+                .min_scrolled_width(crate::tools::max_window_width(ctx) - 30.0)
                 .show(ui, |ui| {
             egui::Grid::new("manage_form")
                 .num_columns(2)

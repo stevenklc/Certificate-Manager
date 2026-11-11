@@ -6,6 +6,7 @@ mod devshot;
 mod fonts;
 mod graph;
 mod handshake;
+mod help;
 mod manage;
 mod tools;
 mod widgets;

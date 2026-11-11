@@ -16,6 +16,11 @@ pub fn max_window_height(ctx: &egui::Context) -> f32 {
     (ctx.screen_rect().height() - 60.0).max(200.0)
 }
 
+/// 視窗可用的最大寬度。
+pub fn max_window_width(ctx: &egui::Context) -> f32 {
+    (ctx.screen_rect().width() - 40.0).max(240.0)
+}
+
 /// 底部的「關閉」按鈕（也接受 Esc）；回傳 true 表示要關閉。
 pub fn close_button(ui: &mut egui::Ui) -> bool {
     ui.separator();
@@ -34,6 +39,7 @@ pub fn verify_window(ctx: &egui::Context, v: &Verification) -> bool {
         .resizable(true)
         .default_width(560.0)
         .max_height(max_h)
+        .max_width(max_window_width(ctx))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             egui::ScrollArea::vertical()
@@ -147,6 +153,7 @@ impl JavaTest {
             .default_width(680.0)
             .default_height(480.0)
             .max_height(max_h)
+            .max_width(max_window_width(ctx))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(match &self.file {
@@ -301,6 +308,7 @@ impl RoleCheck {
             .resizable(true)
             .default_width(640.0)
             .max_height(max_h)
+            .max_width(max_window_width(ctx))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {

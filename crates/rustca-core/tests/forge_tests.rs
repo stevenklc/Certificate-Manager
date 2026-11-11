@@ -455,3 +455,28 @@ fn role_checks() {
     assert!(!name_matches("*.example.com", "a.b.example.com"));
     assert!(!name_matches("*.example.com", "example.com"));
 }
+
+#[test]
+fn issuance_forest_covers_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, _) = make_store(&dir.path().join("f.jks"), StoreFormat::Jks);
+    let other_root = forge::issue(
+        &spec("Other Root", Profile::RootCa, KeyAlg::EcP256),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut pool: Vec<&CertInfo> = ks.all_certs();
+    pool.push(&other_root.cert);
+    let target = &ks.entry("server").unwrap().chain[0].sha256;
+    let f = issuance_forest(&pool, Some(target));
+    let tops: Vec<_> = f
+        .nodes
+        .iter()
+        .filter(|n| n.parent.is_none())
+        .map(|n| n.cert.display_name())
+        .collect();
+    assert_eq!(tops, ["Other Root", "Test Root"]);
+    assert_eq!(f.nodes.len(), 4);
+    assert_eq!(f.nodes.iter().filter(|n| n.is_target).count(), 1);
+}
