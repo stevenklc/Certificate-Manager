@@ -315,6 +315,9 @@ impl App {
                                     .clicked()
                                 {
                                     self.selected_store = Some(i);
+                                    if self.selected_entry.is_some_and(|(s, _)| s != i) {
+                                        self.selected_entry = None;
+                                    }
                                 }
                                 ui.horizontal_wrapped(|ui| {
                                     ui.weak(format!("{} · {} 個條目", ks.format, ks.entries.len()));
@@ -700,9 +703,9 @@ impl App {
 
     /// 目前操作的憑證庫：選取條目所在的檔案，否則為左側選取的檔案。
     fn target_store(&self) -> Option<usize> {
-        self.selected_entry
-            .map(|(s, _)| s)
-            .or(self.selected_store)
+        // 左側有選檔案時以它為準；「全部檔案」時才看選取條目所在的檔案
+        self.selected_store
+            .or(self.selected_entry.map(|(s, _)| s))
             .filter(|i| *i < self.stores.len())
     }
 
