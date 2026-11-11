@@ -471,11 +471,15 @@ impl App {
                 ui.separator();
                 if self.tab == Tab::Browse {
                     ui.label("🔍");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("搜尋別名、主體、簽發者、SAN、序號、指紋…")
-                            .desired_width(320.0),
-                    );
+                    let active = !self.search.trim().is_empty();
+                    let mut search = egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("搜尋別名、主體、簽發者、SAN、序號、指紋…")
+                        .desired_width(320.0);
+                    if active {
+                        // 篩選中：加底色提醒
+                        search = search.background_color(YELLOW.gamma_multiply(0.25));
+                    }
+                    ui.add(search);
                     if !self.search.is_empty() && ui.small_button("✖").clicked() {
                         self.search.clear();
                     }
@@ -755,12 +759,77 @@ impl App {
         }
         let show_file = self.selected_store.is_none();
         let show_match = !matcher.is_empty();
-        ui.horizontal(|ui| {
+        let mut clear_search = false;
+        let mut show_all_files = false;
+        ui.horizontal_wrapped(|ui| {
             ui.strong(format!("{} 個條目", rows.len()));
             if show_match {
-                ui.weak(format!("（符合「{}」）", self.search.trim()));
+                ui.colored_label(
+                    YELLOW,
+                    format!("🔍 搜尋中：只顯示符合「{}」的條目", self.search.trim()),
+                );
+                if ui.small_button("✖ 清除搜尋").clicked() {
+                    clear_search = true;
+                }
             }
         });
+        if show_match && rows.is_empty() {
+            // 搜尋沒有結果：說明原因，並提示其他檔案的符合數
+            let total: usize = self
+                .selected_store
+                .and_then(|i| self.stores.get(i))
+                .map_or(0, |ks| ks.entries.len());
+            let elsewhere: usize = match self.selected_store {
+                Some(cur) => self
+                    .stores
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != cur)
+                    .map(|(_, ks)| {
+                        ks.entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(ei, e)| !matcher.entry(*ei, e).is_empty())
+                            .count()
+                    })
+                    .sum(),
+                None => 0,
+            };
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| {
+                let msg = if total > 0 {
+                    format!(
+                        "這個檔案的 {total} 個條目都不符合搜尋「{}」",
+                        self.search.trim()
+                    )
+                } else {
+                    format!("沒有符合搜尋「{}」的條目", self.search.trim())
+                };
+                ui.label(RichText::new(msg).size(16.0));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("✖ 清除搜尋，顯示全部條目").clicked() {
+                        clear_search = true;
+                    }
+                    if elsewhere > 0
+                        && ui
+                            .button(format!(
+                                "🔍 其他已開啟的檔案有 {elsewhere} 個符合，切到「全部檔案」"
+                            ))
+                            .clicked()
+                    {
+                        show_all_files = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+        }
+        if clear_search {
+            self.search.clear();
+        }
+        if show_all_files {
+            self.selected_store = None;
+        }
 
         let mut clicked = None;
         let mut menu_act = None;
@@ -1711,8 +1780,14 @@ impl eframe::App for App {
                         }
                         "" => {}
                         t => {
-                            self.search = t.to_string();
-                            self.selected_store = None;
+                            // 「@字」：只在第一個檔案中搜尋；否則跨所有檔案
+                            match t.strip_prefix('@') {
+                                Some(q) => self.search = q.to_string(),
+                                None => {
+                                    self.search = t.to_string();
+                                    self.selected_store = None;
+                                }
+                            }
                         }
                     }
                 }
