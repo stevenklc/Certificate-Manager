@@ -37,7 +37,7 @@
   - 憑證庫：JKS ⇄ JCEKS ⇄ PKCS#12，也能把 PEM 憑證 + 私鑰轉成憑證庫；PKCS#12 可選「舊版相容」演算法（3DES + HmacSHA1）給舊版 Java
   - 憑證：PEM ⇄ DER（.cer）⇄ PKCS#7（.p7b），可從憑證庫取出憑證鏈或私鑰
 - **製作憑證庫與憑證鏈**
-  - 建立新的空白憑證庫
+  - 建立新的空白憑證庫，或**由多個現成的 cer / key 檔組成憑證庫**：一次選取多個 .cer / .crt / .pem / .key / .p7b / .p12，自動用公鑰配對私鑰與憑證、用一起選取的 CA 憑證補齊憑證鏈，其餘 CA 成為信任憑證；建立前可預覽、調整別名、取消勾選（既有憑證庫也可用「📥 批次匯入」）
   - 一次產生「根 CA → 中繼 CA（可多層）→ Server / Client 憑證」，金鑰可選 RSA 2048/3072/4096、EC P-256/P-384，可設定 SAN、有效天數、O / OU / C
   - 可保存 CA 私鑰，之後再用憑證庫中的 CA 簽發新的憑證
 - **Java 相容性測試**：自動找出本機安裝的各版本 JDK / JRE（JAVA_HOME、PATH、常見安裝目錄、`~/.jdks`，也可手動加入目錄），用每個版本的 keytool 實際讀取憑證庫並解開每把私鑰，並提示已知的版本限制（例如 PKCS#12 AES 需 Java 8u301+、EdDSA 需 Java 15+）
@@ -127,6 +127,8 @@ rust-ca --json list server.jks
 rust-ca manage import-cert truststore.jks -f partner-ca.cer -a partner-ca --create
 rust-ca manage import-key server.jks --cert server.crt --key server.key -a server
 rust-ca manage import-key server.jks --from old.p12 --from-alias 1 -a server
+# 由多個 cer + key 組成憑證庫（自動配對、補齊憑證鏈；--dry-run 只看規劃結果）
+rust-ca manage assemble servers.jks certs/*.crt certs/*.key ca/*.cer --create
 rust-ca manage delete server.jks -a old-server
 rust-ca manage rename server.jks -a server -n server-2026
 

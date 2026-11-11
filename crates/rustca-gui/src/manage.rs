@@ -10,7 +10,7 @@ use rustca_core::{
     StoreFormat,
 };
 
-use crate::widgets::{pick_cert_file, RED, YELLOW};
+use crate::widgets::{pick_cert_file, pick_cert_files, GREEN, RED, YELLOW};
 
 const MIN_PW: usize = 6;
 
@@ -20,6 +20,14 @@ pub enum Kind {
         format: StoreFormat,
         pw: String,
         pw2: String,
+        /// 選填：由多個憑證 / 私鑰檔組成內容
+        asm: Box<Assembly>,
+    },
+    /// 批次匯入多個憑證 / 私鑰檔到既有憑證庫
+    Assemble {
+        store: usize,
+        asm: Box<Assembly>,
+        overwrite: bool,
     },
     ImportCert {
         store: usize,
@@ -98,6 +106,207 @@ pub enum Kind {
     },
     /// 製作憑證鏈
     GenChain(Box<GenChain>),
+}
+
+/// 由多個憑證 / 私鑰檔組成憑證庫內容。
+#[derive(Default)]
+pub struct Assembly {
+    pub files: Vec<PathBuf>,
+    /// 來源檔密碼（.p12 / .jks / 加密私鑰）
+    pub pw: String,
+    pub plan: edit::AssemblyPlan,
+    /// 無法讀取的檔案
+    pub errors: Vec<String>,
+}
+
+impl Assembly {
+    pub fn reload(&mut self) {
+        self.errors.clear();
+        let mut loaded = Vec::new();
+        for f in &self.files {
+            let opts = LoadOptions {
+                password: nonempty(&self.pw),
+                key_password: None,
+            };
+            // 有密碼先用密碼讀，失敗再不帶密碼（.cer / .pem 不需要密碼）
+            let r = load_file(f, &opts).or_else(|e| {
+                if opts.password.is_some() {
+                    load_file(f, &LoadOptions::default()).map_err(|_| e)
+                } else {
+                    Err(e)
+                }
+            });
+            match r {
+                Ok(ks) => loaded.push(ks),
+                Err(e) if e.is_password_problem() => self.errors.push(format!(
+                    "{}：需要密碼或密碼錯誤，請填「來源檔密碼」",
+                    file_name(f)
+                )),
+                Err(e) => self.errors.push(format!("{}：{e}", file_name(f))),
+            }
+        }
+        self.plan = edit::plan_assembly(&loaded);
+    }
+
+    fn selected(&self) -> usize {
+        self.plan.keys.iter().filter(|k| k.include).count()
+            + self.plan.certs.iter().filter(|c| c.include).count()
+    }
+
+    /// 套用前檢查：別名不可空白或重複。
+    fn check(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        let aliases = self
+            .plan
+            .keys
+            .iter()
+            .filter(|k| k.include)
+            .map(|k| &k.alias)
+            .chain(
+                self.plan
+                    .certs
+                    .iter()
+                    .filter(|c| c.include)
+                    .map(|c| &c.alias),
+            );
+        for a in aliases {
+            let a = a.trim();
+            if a.is_empty() {
+                return Err("有條目的別名是空白".into());
+            }
+            if !seen.insert(a.to_lowercase()) {
+                return Err(format!("別名「{a}」重複"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+/// 「憑證 / 私鑰檔」選取與預覽（放在表單 Grid 的一列中）。
+fn assembly_ui(ui: &mut egui::Ui, label: &str, a: &mut Assembly) {
+    ui.label(label);
+    ui.vertical(|ui| {
+        let mut reload = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("📂 選擇憑證 / 私鑰檔…")
+                .on_hover_text("可多選：.cer / .crt / .pem / .key / .p7b / .p12 / .jks")
+                .clicked()
+            {
+                for f in pick_cert_files() {
+                    if !a.files.contains(&f) {
+                        a.files.push(f);
+                    }
+                }
+                reload = true;
+            }
+            if !a.files.is_empty() {
+                if ui.button("清除").clicked() {
+                    *a = Assembly::default();
+                }
+                ui.weak(format!("已選 {} 個檔案", a.files.len()))
+                    .on_hover_text(
+                        a.files
+                            .iter()
+                            .map(|f| f.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("來源檔密碼");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut a.pw)
+                    .password(true)
+                    .hint_text(".p12 / .jks / 加密私鑰才需要")
+                    .desired_width(180.0),
+            );
+            if r.lost_focus() && !a.files.is_empty() {
+                reload = true;
+            }
+            if !a.files.is_empty() && ui.small_button("🔄 重新分析").clicked() {
+                reload = true;
+            }
+        });
+        if reload {
+            a.reload();
+        }
+        if a.files.is_empty() {
+            ui.weak(
+                "私鑰會依公鑰自動配對憑證，並用一起選取的 CA 憑證補齊憑證鏈；其餘憑證成為信任憑證",
+            );
+            return;
+        }
+        let now = now_ts();
+        egui::Grid::new("asm_plan")
+            .num_columns(5)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("");
+                ui.strong("別名");
+                ui.strong("類型");
+                ui.strong("憑證");
+                ui.strong("來源");
+                ui.end_row();
+                for k in a.plan.keys.iter_mut() {
+                    ui.checkbox(&mut k.include, "");
+                    ui.add_sized([170.0, 20.0], egui::TextEdit::singleline(&mut k.alias));
+                    let t = format!("🔑 私鑰條目（鏈 {}）", k.chain.len());
+                    if k.complete {
+                        ui.colored_label(GREEN, t)
+                            .on_hover_text("憑證鏈完整，連到自簽根憑證");
+                    } else {
+                        ui.colored_label(YELLOW, format!("{t} ⚠"))
+                            .on_hover_text("找不到上層 CA，憑證鏈不完整；可再加入 CA 的 .cer");
+                    }
+                    cert_cell(ui, &k.chain[0], now);
+                    ui.weak(&k.source);
+                    ui.end_row();
+                }
+                for c in a.plan.certs.iter_mut() {
+                    ui.checkbox(&mut c.include, "");
+                    ui.add_sized([170.0, 20.0], egui::TextEdit::singleline(&mut c.alias));
+                    ui.label(format!("信任憑證 · {}", c.cert.role()));
+                    cert_cell(ui, &c.cert, now);
+                    ui.weak(&c.source);
+                    ui.end_row();
+                }
+            });
+        for p in a.plan.problems.iter().chain(&a.errors) {
+            ui.colored_label(YELLOW, format!("⚠ {p}"));
+        }
+        if a.plan.keys.is_empty() && a.plan.certs.is_empty() {
+            ui.colored_label(YELLOW, "沒有可加入的憑證");
+        }
+    });
+    ui.end_row();
+}
+
+fn cert_cell(ui: &mut egui::Ui, c: &CertInfo, now: i64) {
+    let st = c.status_at(now, 30);
+    let text = format!(
+        "{} · 到期 {}",
+        c.display_name(),
+        rustca_core::format_ts(c.not_after)
+            .chars()
+            .take(10)
+            .collect::<String>()
+    );
+    let color = crate::widgets::status_color(st);
+    ui.colored_label(color, text).on_hover_text(format!(
+        "主體：{}\n簽發者：{}\n{}",
+        c.subject,
+        c.issuer,
+        st.label()
+    ));
 }
 
 /// 「製作憑證鏈」表單。
@@ -260,16 +469,37 @@ pub fn apply(kind: &Kind, stores: &mut [Keystore]) -> Result<Effect, String> {
             format,
             pw,
             pw2,
+            asm,
         } => {
             let path = path.as_ref().ok_or("請選擇檔案位置")?;
             if path.exists() {
                 return Err(format!("{} 已存在", path.display()));
             }
             let pw = new_pw(pw, pw2)?;
+            asm.check()?;
             let mut ks = edit::new_keystore(path, *format, &pw).map_err(s)?;
+            let n = edit::apply_assembly(&mut ks, &asm.plan, false).map_err(s)?;
             edit::save(&mut ks, None, None, false).map_err(s)?;
-            let msg = format!("已建立 {} 憑證庫：{}", ks.format, path.display());
+            let mut msg = format!("已建立 {} 憑證庫：{}", ks.format, path.display());
+            if n > 0 {
+                msg.push_str(&format!("（{n} 個條目）"));
+            }
             Ok(Effect::Created(Box::new(ks), msg))
+        }
+        Kind::Assemble {
+            store,
+            asm,
+            overwrite,
+        } => {
+            let mut ks = stores[*store].clone();
+            editable(&ks)?;
+            if asm.selected() == 0 {
+                return Err("請選擇要匯入的憑證 / 私鑰檔".into());
+            }
+            asm.check()?;
+            let n = edit::apply_assembly(&mut ks, &asm.plan, *overwrite).map_err(s)?;
+            stores[*store] = ks;
+            Ok(Effect::Modified(*store, format!("已批次匯入 {n} 個條目")))
         }
         Kind::ImportCert {
             store,
@@ -824,6 +1054,7 @@ fn default_alias(p: &Path) -> String {
 fn title(kind: &Kind) -> &'static str {
     match kind {
         Kind::NewStore { .. } => "🆕 新增憑證庫",
+        Kind::Assemble { .. } => "📥 批次匯入憑證 / 私鑰檔",
         Kind::ImportCert { .. } => "➕ 匯入信任憑證",
         Kind::ImportKey { .. } => "➕ 匯入金鑰對",
         Kind::Rename { .. } => "✏ 修改別名",
@@ -866,11 +1097,27 @@ pub fn show(d: &mut Dialog, ctx: &egui::Context, stores: &[Keystore]) -> Option<
                         format,
                         pw,
                         pw2,
+                        asm,
                     } => {
                         save_field(ui, path, format, "keystore.jks");
                         pw_field(ui, "憑證庫密碼", pw, "至少 6 個字元");
                         pw_field(ui, "再次輸入", pw2, "");
-                        ok_label = "建立";
+                        assembly_ui(ui, "內容（選填）", asm);
+                        ok_label = if asm.selected() > 0 { "建立並加入" } else { "建立空的憑證庫" };
+                    }
+                    Kind::Assemble {
+                        store,
+                        asm,
+                        overwrite,
+                    } => {
+                        ui.label("匯入到");
+                        ui.strong(store_name(store));
+                        ui.end_row();
+                        assembly_ui(ui, "檔案", asm);
+                        ui.label("");
+                        ui.checkbox(overwrite, "別名已存在時覆蓋");
+                        ui.end_row();
+                        ok_label = "匯入";
                     }
                     Kind::ImportCert {
                         store,

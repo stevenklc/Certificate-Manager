@@ -247,6 +247,7 @@ impl App {
                             format: StoreFormat::Jks,
                             pw: String::new(),
                             pw2: String::new(),
+                            asm: Default::default(),
                         }
                         .into(),
                     );
@@ -1145,6 +1146,17 @@ impl App {
                 });
             }
             if ui
+                .add_enabled(can_edit, egui::Button::new("📥 批次匯入…"))
+                .on_hover_text("一次選取多個 .cer / .key / .p12…，自動配對私鑰與憑證並補齊憑證鏈")
+                .clicked()
+            {
+                open = Some(Kind::Assemble {
+                    store: si,
+                    asm: Default::default(),
+                    overwrite: false,
+                });
+            }
+            if ui
                 .add_enabled(can_edit, egui::Button::new("🔐 改憑證庫密碼"))
                 .clicked()
             {
@@ -1368,6 +1380,27 @@ impl eframe::App for App {
                         .unwrap_or(0);
                     self.selected_entry = Some((0, first));
                     match shot.tab.as_str() {
+                        "asm" => {
+                            // RUST_CA_ASM_DIR 中的所有檔案作為「新增憑證庫」的內容
+                            let mut asm = manage::Assembly::default();
+                            if let Some(d) = std::env::var_os("RUST_CA_ASM_DIR") {
+                                if let Ok(rd) = std::fs::read_dir(d) {
+                                    asm.files = rd.flatten().map(|e| e.path()).collect();
+                                    asm.files.sort();
+                                }
+                            }
+                            asm.reload();
+                            self.dialog = Some(
+                                Kind::NewStore {
+                                    path: Some("servers.jks".into()),
+                                    format: StoreFormat::Jks,
+                                    pw: String::new(),
+                                    pw2: String::new(),
+                                    asm: Box::new(asm),
+                                }
+                                .into(),
+                            );
+                        }
                         "sort" => {
                             self.selected_store = None;
                             self.sort = Some((SortCol::NotAfter, false));

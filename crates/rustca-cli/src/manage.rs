@@ -133,6 +133,36 @@ pub enum ManageCmd {
         #[command(flatten)]
         save: SaveArgs,
     },
+    /// 由多個憑證 / 私鑰檔組成憑證庫：自動配對私鑰與憑證、補齊憑證鏈，其餘憑證成為信任憑證
+    #[command(alias = "build")]
+    Assemble {
+        store: PathBuf,
+        /// 來源檔案（.cer / .crt / .pem / .key / .p7b / .p12 / .jks…），可多個或用萬用字元
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+        /// 來源檔密碼（.p12 / .jks / 加密私鑰）
+        #[arg(long)]
+        from_password: Option<String>,
+        /// 只加入私鑰條目，不把 CA 等其餘憑證加為信任憑證
+        #[arg(long)]
+        keys_only: bool,
+        /// 只顯示規劃結果，不寫入
+        #[arg(long)]
+        dry_run: bool,
+        /// 別名已存在時覆蓋
+        #[arg(long)]
+        overwrite: bool,
+        /// 憑證庫不存在時建立新的
+        #[arg(long)]
+        create: bool,
+        /// 建立新憑證庫時的格式（預設依副檔名判斷）
+        #[arg(long = "type", value_enum)]
+        store_type: Option<StoreType>,
+        #[command(flatten)]
+        pw: PasswordArgs,
+        #[command(flatten)]
+        save: SaveArgs,
+    },
     /// 匯入金鑰對：來自另一個憑證庫，或「憑證檔 + 私鑰檔」
     ImportKey {
         store: PathBuf,
@@ -558,6 +588,69 @@ pub fn run(cmd: ManageCmd, out: &Out) -> Result<u8> {
                 out,
                 &format!("已匯入 {} 張信任憑證", added.len()),
             )?;
+        }
+        ManageCmd::Assemble {
+            store,
+            files,
+            from_password,
+            keys_only,
+            dry_run,
+            overwrite,
+            create,
+            store_type,
+            pw,
+            save,
+        } => {
+            let mut sources = Vec::new();
+            for f in &files {
+                // 有密碼先用密碼讀，失敗再不帶密碼（.cer / .pem 不需要密碼）
+                let ks = match load_any(f, from_password.clone()) {
+                    Ok(k) => k,
+                    Err(e) if from_password.is_some() => load_any(f, None).map_err(|_| e)?,
+                    Err(e) => return Err(e),
+                };
+                sources.push(ks);
+            }
+            let mut plan = edit::plan_assembly(&sources);
+            if keys_only {
+                plan.certs.clear();
+            }
+            for k in &plan.keys {
+                let state = if k.complete {
+                    "鏈完整"
+                } else {
+                    "鏈不完整"
+                };
+                out.info(&format!(
+                    "  🔑 {} ← {}（鏈 {} 張，{state}；{}）",
+                    k.alias,
+                    k.chain[0].subject,
+                    k.chain.len(),
+                    k.source
+                ));
+            }
+            for c in &plan.certs {
+                out.info(&format!(
+                    "  📄 {} ← {}（信任憑證 · {}；{}）",
+                    c.alias,
+                    c.cert.subject,
+                    c.cert.role(),
+                    c.source
+                ));
+            }
+            for p in &plan.problems {
+                out.warn(p);
+            }
+            if plan.keys.is_empty() && plan.certs.is_empty() {
+                bail!("沒有可加入的憑證");
+            }
+            if dry_run {
+                out.info("（--dry-run：未寫入）");
+                return Ok(0);
+            }
+            let mut ks = open_or_create(&store, &pw, create, store_type, out)?;
+            let n = edit::apply_assembly(&mut ks, &plan, overwrite)?;
+            finish(&mut ks, &save, out, &format!("已加入 {n} 個條目"))?;
         }
         ManageCmd::ImportKey {
             store,

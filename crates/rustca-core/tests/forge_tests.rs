@@ -326,3 +326,88 @@ fn check_key_password_variants() {
     assert!(edit::check_key_password(&back, "server", PW).unwrap());
     assert!(!edit::check_key_password(&back, "server", "nope").unwrap());
 }
+
+#[test]
+fn assemble_store_from_cer_and_key_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = forge::issue_chain(
+        &[
+            spec("Asm Root", Profile::RootCa, KeyAlg::EcP256),
+            spec("Asm Issuing", Profile::IntermediateCa, KeyAlg::EcP256),
+            spec("a.example.com", Profile::Server, KeyAlg::Rsa2048),
+        ],
+        None,
+    )
+    .unwrap();
+    let b = forge::issue(
+        &spec("b.example.com", Profile::Server, KeyAlg::EcP256),
+        Some(Signer {
+            cert: &chain[1].cert,
+            key_pkcs8: &chain[1].key_pkcs8,
+        }),
+        None,
+    )
+    .unwrap();
+    let write = |name: &str, data: String| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, data).unwrap();
+        load_file(&p, &LoadOptions::default()).unwrap()
+    };
+    let key_pem = |pkcs8: &[u8]| {
+        let mut ks = edit::new_keystore("x.p12", StoreFormat::Pkcs12, PW).unwrap();
+        edit::add_key_entry(
+            &mut ks,
+            "k",
+            vec![chain[0].cert.clone()],
+            pkcs8.to_vec(),
+            None,
+            true,
+        )
+        .unwrap();
+        edit::private_key_pem(ks.entry("k").unwrap()).unwrap()
+    };
+    // 檔案順序故意打亂；私鑰與憑證分開
+    let sources = vec![
+        write("b.key", key_pem(&b.key_pkcs8)),
+        write("root.cer", chain[0].cert.to_pem()),
+        write("a.crt", chain[2].cert.to_pem()),
+        write("inter.cer", chain[1].cert.to_pem()),
+        write("a.key", key_pem(&chain[2].key_pkcs8)),
+        write("b.crt", b.cert.to_pem()),
+        // 重複的憑證只算一次
+        write("root-copy.pem", chain[0].cert.to_pem()),
+    ];
+    let mut plan = edit::plan_assembly(&sources);
+    assert!(plan.problems.is_empty(), "{:?}", plan.problems);
+    let mut keys: Vec<_> = plan.keys.iter().map(|k| k.alias.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, ["a.example.com", "b.example.com"]);
+    assert!(plan.keys.iter().all(|k| k.complete && k.chain.len() == 3));
+    let mut certs: Vec<_> = plan.certs.iter().map(|c| c.alias.as_str()).collect();
+    certs.sort();
+    assert_eq!(certs, ["asm-issuing", "asm-root"]);
+
+    // 調整別名、取消中繼 CA 後建立 JKS
+    plan.keys[0].alias = "web-1".into();
+    plan.certs
+        .iter_mut()
+        .find(|c| c.alias == "asm-issuing")
+        .unwrap()
+        .include = false;
+    let mut ks = edit::new_keystore(dir.path().join("out.jks"), StoreFormat::Jks, PW).unwrap();
+    assert_eq!(edit::apply_assembly(&mut ks, &plan, false).unwrap(), 3);
+    edit::save(&mut ks, None, None, false).unwrap();
+    let back = load_file(&ks.path, &LoadOptions::with_password(PW)).unwrap();
+    assert_eq!(back.entries.len(), 3);
+    for k in back.private_key_entries() {
+        let v = edit::verify_entry(&back, &k.alias, now_ts()).unwrap();
+        assert!(v.ok, "{}: {:?}", k.alias, v.checks);
+    }
+
+    // 私鑰找不到憑證 → 列為問題
+    let lonely =
+        forge::issue(&spec("lonely", Profile::Server, KeyAlg::EcP256), None, None).unwrap();
+    let plan = edit::plan_assembly(&[write("lonely.key", key_pem(&lonely.key_pkcs8))]);
+    assert!(plan.keys.is_empty());
+    assert_eq!(plan.problems.len(), 1);
+}

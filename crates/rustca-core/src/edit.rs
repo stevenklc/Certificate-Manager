@@ -2,6 +2,7 @@
 //!
 //! 所有操作都在記憶體中的 [`Keystore`] 上進行，最後呼叫 [`save`] 寫回檔案。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::cert::CertInfo;
@@ -1060,4 +1061,174 @@ pub fn replace_chain(
     }
     *ks = work;
     Ok((notes, v))
+}
+
+// ───────────── 由多個憑證 / 私鑰檔組成憑證庫 ─────────────
+
+/// 組裝計畫中的私鑰條目。
+#[derive(Debug, Clone)]
+pub struct PlannedKey {
+    pub include: bool,
+    pub alias: String,
+    /// 終端憑證在前，已依簽發關係排序
+    pub chain: Vec<CertInfo>,
+    /// 私鑰來源（含已解密的私鑰）
+    pub key: Entry,
+    /// 「私鑰檔 + 憑證檔」
+    pub source: String,
+    /// 憑證鏈是否完整連到自簽根憑證
+    pub complete: bool,
+}
+
+/// 組裝計畫中的信任憑證條目。
+#[derive(Debug, Clone)]
+pub struct PlannedCert {
+    pub include: bool,
+    pub alias: String,
+    pub cert: CertInfo,
+    pub source: String,
+}
+
+/// [`plan_assembly`] 的結果，可在套用前調整別名與勾選。
+#[derive(Debug, Clone, Default)]
+pub struct AssemblyPlan {
+    pub keys: Vec<PlannedKey>,
+    pub certs: Vec<PlannedCert>,
+    /// 無法處理的項目（找不到相符憑證、私鑰未解密…）
+    pub problems: Vec<String>,
+}
+
+/// 依 CN 產生別名：小寫、空白與特殊字元改成「-」，並避開已使用的名稱。
+pub fn suggest_alias(cert: &CertInfo, used: &mut HashSet<String>) -> String {
+    let base: String = cert
+        .display_name()
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let base = base.trim_matches('-').to_string();
+    let base = if base.is_empty() { "cert".into() } else { base };
+    let mut alias = base.clone();
+    let mut n = 2;
+    while !used.insert(alias.clone()) {
+        alias = format!("{base}-{n}");
+        n += 1;
+    }
+    alias
+}
+
+/// 從多個已載入的檔案（.cer / .crt / .pem / .key / .p7b / .p12 / .jks…）規劃憑證庫內容：
+/// * 每把私鑰以公鑰找出相符的憑證，並用所有檔案中的 CA 憑證補齊憑證鏈 → 私鑰條目
+/// * 其餘憑證（CA、沒有私鑰的憑證）→ 信任憑證條目；用在鏈中的 CA 也會保留為信任憑證
+/// * 重複的憑證 / 私鑰只取一次
+pub fn plan_assembly(sources: &[Keystore]) -> AssemblyPlan {
+    let mut plan = AssemblyPlan::default();
+    let mut used = HashSet::new();
+
+    // 所有憑證（去重），記錄來源檔名
+    let mut certs: Vec<(CertInfo, String)> = Vec::new();
+    for ks in sources {
+        for c in ks.all_certs() {
+            if !certs.iter().any(|(x, _)| x.sha256 == c.sha256) {
+                certs.push((c.clone(), ks.name()));
+            }
+        }
+    }
+    let pool: Vec<&CertInfo> = certs.iter().map(|(c, _)| c).collect();
+
+    // 私鑰
+    let mut leaf_shas = HashSet::new();
+    let mut seen_keys: Vec<Vec<u8>> = Vec::new();
+    for ks in sources {
+        for e in ks
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::PrivateKey)
+        {
+            let KeyState::Decrypted { format, der } = &e.key else {
+                plan.problems.push(format!(
+                    "{} / {}：私鑰尚未解密（請先輸入密碼開啟）",
+                    ks.name(),
+                    e.alias
+                ));
+                continue;
+            };
+            if seen_keys.contains(der) {
+                continue;
+            }
+            seen_keys.push(der.clone());
+            // 條目本身有憑證（.p12 / .jks）就用它，否則從所有憑證中找公鑰相符的
+            let leaf = e.chain.first().cloned().or_else(|| {
+                pool.iter()
+                    .find(|c| crate::tls::key_matches_cert(*format, der, c) == Some(true))
+                    .map(|c| (*c).clone())
+            });
+            let Some(leaf) = leaf else {
+                plan.problems.push(format!(
+                    "{}：找不到與這把私鑰相符的憑證，請一併選取它的 .cer / .crt",
+                    ks.name()
+                ));
+                continue;
+            };
+            let built = build_chain(std::slice::from_ref(&leaf), &pool, crate::cert::now_ts(), 0);
+            let complete = matches!(built.end, crate::chain::ChainEnd::Root);
+            let chain: Vec<CertInfo> = built.links.into_iter().map(|l| l.cert).collect();
+            leaf_shas.insert(leaf.sha256.clone());
+            let cert_src = certs
+                .iter()
+                .find(|(c, _)| c.sha256 == leaf.sha256)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| ks.name());
+            let source = if cert_src == ks.name() {
+                ks.name()
+            } else {
+                format!("{} + {cert_src}", ks.name())
+            };
+            plan.keys.push(PlannedKey {
+                include: true,
+                alias: suggest_alias(&leaf, &mut used),
+                chain,
+                key: e.clone(),
+                source,
+                complete,
+            });
+        }
+    }
+
+    // 其餘憑證 → 信任憑證
+    for (c, src) in &certs {
+        if leaf_shas.contains(&c.sha256) {
+            continue;
+        }
+        plan.certs.push(PlannedCert {
+            include: true,
+            alias: suggest_alias(c, &mut used),
+            cert: c.clone(),
+            source: src.clone(),
+        });
+    }
+    plan
+}
+
+/// 把組裝計畫中勾選的項目加入憑證庫；回傳加入的條目數。
+pub fn apply_assembly(ks: &mut Keystore, plan: &AssemblyPlan, overwrite: bool) -> Result<usize> {
+    let mut n = 0;
+    for k in plan.keys.iter().filter(|k| k.include) {
+        let mut src = k.key.clone();
+        src.chain = k.chain.clone();
+        import_key_entry(ks, k.alias.trim(), &src, None, overwrite)?;
+        n += 1;
+    }
+    for c in plan.certs.iter().filter(|c| c.include) {
+        import_certs(ks, c.alias.trim(), std::slice::from_ref(&c.cert), overwrite)?;
+        n += 1;
+    }
+    Ok(n)
 }
