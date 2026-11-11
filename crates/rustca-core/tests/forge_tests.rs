@@ -411,3 +411,47 @@ fn assemble_store_from_cer_and_key_files() {
     assert!(plan.keys.is_empty());
     assert_eq!(plan.problems.len(), 1);
 }
+
+#[test]
+fn role_checks() {
+    use rustca_core::role::{check_role, name_matches, store_kind, StoreRole};
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, chain) = make_store(&dir.path().join("role.jks"), StoreFormat::Jks);
+    assert_eq!(store_kind(&ks), "Keystore + Truststore");
+    let errs = |r: &rustca_core::role::RoleReport| {
+        r.sections
+            .iter()
+            .flat_map(|s| &s.checks)
+            .filter(|c| c.level == CheckLevel::Error)
+            .map(|c| c.message.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Server：主機名稱相符 / 不符
+    let r = check_role(&ks, StoreRole::Server, Some("svc.example.com"), now_ts());
+    assert!(r.ok, "{:?}", errs(&r));
+    let r = check_role(&ks, StoreRole::Server, Some("other.example.com"), now_ts());
+    assert!(!r.ok);
+    assert!(errs(&r).iter().any(|m| m.contains("other.example.com")));
+
+    // Client：Server 憑證沒有 clientAuth → 錯誤
+    let r = check_role(&ks, StoreRole::Client, None, now_ts());
+    assert!(errs(&r).iter().any(|m| m.contains("clientAuth")));
+
+    // Truststore：含私鑰只是警告；根 CA 有效 → 沒有錯誤
+    let r = check_role(&ks, StoreRole::Truststore, None, now_ts());
+    assert!(r.ok && r.warnings > 0);
+
+    // 只有終端憑證的信任庫 → 警告憑證釘選
+    let mut ts = edit::new_keystore(dir.path().join("t.jks"), StoreFormat::Jks, PW).unwrap();
+    edit::import_certs(&mut ts, "leaf", &[chain[2].cert.clone()], false).unwrap();
+    assert_eq!(store_kind(&ts), "Truststore");
+    let r = check_role(&ts, StoreRole::Truststore, None, now_ts());
+    assert!(r.ok && r.warnings > 0);
+    // 信任庫拿去當 Server → 錯誤
+    assert!(!check_role(&ts, StoreRole::Server, None, now_ts()).ok);
+
+    assert!(name_matches("*.example.com", "a.example.com"));
+    assert!(!name_matches("*.example.com", "a.b.example.com"));
+    assert!(!name_matches("*.example.com", "example.com"));
+}

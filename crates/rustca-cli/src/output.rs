@@ -88,6 +88,49 @@ impl Out {
         }
     }
 
+    pub fn role_report(&self, rep: &rustca_core::role::RoleReport) {
+        use rustca_core::edit::CheckLevel;
+        for s in &rep.sections {
+            println!("{}", self.paint(&format!("── {} ──", s.title), CYAN));
+            for c in &s.checks {
+                match c.level {
+                    CheckLevel::Ok => {
+                        println!("  {}", self.paint(&format!("✔ {}", c.message), GREEN))
+                    }
+                    CheckLevel::Warn => {
+                        println!("  {}", self.paint(&format!("⚠ {}", c.message), YELLOW))
+                    }
+                    CheckLevel::Error => {
+                        println!("  {}", self.paint(&format!("✘ {}", c.message), RED))
+                    }
+                }
+            }
+        }
+        let label = rep.role.label();
+        if !rep.ok {
+            println!(
+                "{}",
+                self.paint(
+                    &format!(
+                        "✘ 不適合作為 {label}（{} 個錯誤、{} 個警告）",
+                        rep.errors, rep.warnings
+                    ),
+                    RED
+                )
+            );
+        } else if rep.warnings > 0 {
+            println!(
+                "{}",
+                self.paint(
+                    &format!("⚠ 可以作為 {label}，但有 {} 個警告", rep.warnings),
+                    YELLOW
+                )
+            );
+        } else {
+            println!("{}", self.paint(&format!("✔ 適合作為 {label}"), GREEN));
+        }
+    }
+
     pub fn warn(&self, msg: &str) {
         eprintln!("{} {msg}", self.paint("注意：", YELLOW));
     }

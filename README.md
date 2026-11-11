@@ -41,6 +41,7 @@
   - 一次產生「根 CA → 中繼 CA（可多層）→ Server / Client 憑證」，金鑰可選 RSA 2048/3072/4096、EC P-256/P-384，可設定 SAN、有效天數、O / OU / C
   - 可保存 CA 私鑰，之後再用憑證庫中的 CA 簽發新的憑證
 - **Java 相容性測試**：自動找出本機安裝的各版本 JDK / JRE（JAVA_HOME、PATH、常見安裝目錄、`~/.jdks`，也可手動加入目錄），用每個版本的 keytool 實際讀取憑證庫並解開每把私鑰，並提示已知的版本限制（例如 PKCS#12 AES 需 Java 8u301+、EdDSA 需 Java 15+）
+- **用途檢查**：選擇要當作 Server keystore、Client keystore（mTLS）或 Truststore，檢查是否適合——私鑰與憑證鏈、serverAuth / clientAuth 用途、Key Usage、SAN 是否涵蓋主機名稱、弱演算法；Truststore 則檢查是否只放 CA、有無過期、是否混入私鑰或終端憑證。GUI 左側也會標示每個檔案是 Keystore、Truststore 或兩者都有
 
 ## 建置
 
@@ -127,6 +128,9 @@ rust-ca --json list server.jks
 rust-ca manage import-cert truststore.jks -f partner-ca.cer -a partner-ca --create
 rust-ca manage import-key server.jks --cert server.crt --key server.key -a server
 rust-ca manage import-key server.jks --from old.p12 --from-alias 1 -a server
+# 用途檢查（--as server|client|trust，不指定則依內容判斷；不適合時回傳 2）
+rust-ca manage check-role server.jks --as server --host api.example.com
+rust-ca manage check-role truststore.jks --as trust
 # 由多個 cer + key 組成憑證庫（自動配對、補齊憑證鏈；--dry-run 只看規劃結果）
 rust-ca manage assemble servers.jks certs/*.crt certs/*.key ca/*.cer --create
 rust-ca manage delete server.jks -a old-server

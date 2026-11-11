@@ -46,6 +46,16 @@ pub struct SaveArgs {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+pub enum RoleArg {
+    /// Server keystore
+    Server,
+    /// Client keystore（mTLS）
+    Client,
+    /// Truststore 信任庫
+    Trust,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 pub enum CertOut {
     Pem,
     Der,
@@ -366,6 +376,19 @@ pub enum ManageCmd {
         /// 別名（不指定則驗證所有私鑰條目）
         #[arg(short, long)]
         alias: Option<String>,
+        #[command(flatten)]
+        pw: PasswordArgs,
+    },
+    /// 用途檢查：是否適合作為 Server keystore、Client keystore（mTLS）或 Truststore
+    #[command(alias = "role")]
+    CheckRole {
+        store: PathBuf,
+        /// 要檢查的用途（預設依內容判斷：有私鑰為 server，否則 trust）
+        #[arg(long = "as", value_enum)]
+        role: Option<RoleArg>,
+        /// Server 的主機名稱或 IP，檢查憑證是否涵蓋
+        #[arg(long)]
+        host: Option<String>,
         #[command(flatten)]
         pw: PasswordArgs,
     },
@@ -1134,6 +1157,37 @@ pub fn run(cmd: ManageCmd, out: &Out) -> Result<u8> {
                 }
             }
             return Ok(if all_ok { 0 } else { 2 });
+        }
+        ManageCmd::CheckRole {
+            store,
+            role,
+            host,
+            pw,
+        } => {
+            use rustca_core::role::{check_role, store_kind, StoreRole};
+            let ks = load_any(&store, pw.password)?;
+            let role = match role {
+                Some(RoleArg::Server) => StoreRole::Server,
+                Some(RoleArg::Client) => StoreRole::Client,
+                Some(RoleArg::Trust) => StoreRole::Truststore,
+                None => StoreRole::guess(&ks),
+            };
+            let rep = check_role(&ks, role, host.as_deref(), now_ts());
+            if out.json {
+                out.print_json(&serde_json::to_value(&rep).unwrap_or_default());
+            } else {
+                out.line(
+                    None,
+                    &format!(
+                        "{}（{}）→ 檢查是否適合作為 {}",
+                        ks.name(),
+                        store_kind(&ks),
+                        role.label()
+                    ),
+                );
+                out.role_report(&rep);
+            }
+            return Ok(if rep.ok { 0 } else { 2 });
         }
         ManageCmd::JavaTest {
             store,

@@ -15,6 +15,7 @@ pub mod jks;
 pub mod loader;
 pub mod model;
 pub mod pem;
+pub mod role;
 pub mod search;
 pub mod tls;
 

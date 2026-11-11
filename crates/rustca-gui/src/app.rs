@@ -12,7 +12,7 @@ use rustca_core::{
 
 use crate::handshake::HandshakeState;
 use crate::manage::{self, Dialog, Effect, GenChain, Kind};
-use crate::tools::{verify_window, JavaTest};
+use crate::tools::{verify_window, JavaTest, RoleCheck};
 use crate::widgets::{cert_grid, pick_cert_files, short_dn, status_text, BLUE, GREEN, RED, YELLOW};
 use rustca_core::edit::{CertFormat, Verification};
 
@@ -63,6 +63,7 @@ pub struct App {
     allow_close: bool,
     verify_view: Option<Verification>,
     java_test: Option<JavaTest>,
+    role_check: Option<RoleCheck>,
 }
 
 impl App {
@@ -91,6 +92,7 @@ impl App {
             allow_close: false,
             verify_view: None,
             java_test: None,
+            role_check: None,
         }
     }
 
@@ -368,6 +370,27 @@ impl App {
                                 }
                                 ui.horizontal_wrapped(|ui| {
                                     ui.weak(format!("{} · {} 個條目", ks.format, ks.entries.len()));
+                                    let kind = rustca_core::role::store_kind(ks);
+                                    let keys = ks.private_key_entries().count();
+                                    let trusted = ks
+                                        .entries
+                                        .iter()
+                                        .filter(|e| e.kind == EntryKind::TrustedCert)
+                                        .count();
+                                    let (icon, color) = match kind {
+                                        "Keystore" => ("🔑", GREEN),
+                                        "Truststore" => ("🛡", BLUE),
+                                        "空的" => ("○", Color32::GRAY),
+                                        _ => ("🔑🛡", YELLOW),
+                                    };
+                                    ui.colored_label(color, format!("{icon} {kind}")).on_hover_text(
+                                        format!(
+                                            "{keys} 個私鑰條目、{trusted} 張信任憑證\n\
+                                             Keystore：含私鑰，當作自己的身分（Server / mTLS Client）\n\
+                                             Truststore：只有信任憑證，用來驗證對方\n\
+                                             可用「☑ 用途檢查」確認是否適合"
+                                        ),
+                                    );
                                     if bad > 0 {
                                         ui.colored_label(YELLOW, format!("⚠ {bad} 張需注意"));
                                     }
@@ -1104,6 +1127,7 @@ impl App {
         let mut open: Option<Kind> = None;
         let mut save = false;
         let mut java = false;
+        let mut role = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!("🛠 {}", ks.name()));
             if !writable {
@@ -1205,6 +1229,15 @@ impl App {
             {
                 java = true;
             }
+            if ui
+                .button("☑ 用途檢查")
+                .on_hover_text(
+                    "檢查是否適合當 Server keystore、Client keystore（mTLS）或 Truststore",
+                )
+                .clicked()
+            {
+                role = true;
+            }
         });
         let mut act = None;
         if let Some(e) = entry {
@@ -1225,6 +1258,9 @@ impl App {
                 }
                 Err(e) => self.error(e),
             }
+        }
+        if role {
+            self.role_check = Some(RoleCheck::new(self.stores[si].clone()));
         }
         if java {
             let mut t = JavaTest::new(self.stores[si].clone(), self.dirty[si]);
@@ -1380,6 +1416,9 @@ impl eframe::App for App {
                         .unwrap_or(0);
                     self.selected_entry = Some((0, first));
                     match shot.tab.as_str() {
+                        "role" => {
+                            self.role_check = Some(RoleCheck::new(self.stores[0].clone()));
+                        }
                         "asm" => {
                             // RUST_CA_ASM_DIR 中的所有檔案作為「新增憑證庫」的內容
                             let mut asm = manage::Assembly::default();
@@ -1495,6 +1534,11 @@ impl eframe::App for App {
         if let Some(v) = &self.verify_view {
             if !verify_window(ctx, v) {
                 self.verify_view = None;
+            }
+        }
+        if let Some(r) = self.role_check.as_mut() {
+            if !r.ui(ctx) {
+                self.role_check = None;
             }
         }
         if let Some(t) = self.java_test.as_mut() {

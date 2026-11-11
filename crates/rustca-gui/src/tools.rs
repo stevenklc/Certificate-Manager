@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, RichText};
 use rustca_core::edit::{CheckLevel, Verification, WriteOptions};
 use rustca_core::javacompat::{self, JavaRuntime, JavaTestReport, TestSource};
+use rustca_core::role::{check_role, RoleReport, StoreRole};
 use rustca_core::{Keystore, StoreFormat};
 
 use crate::widgets::{GREEN, RED, YELLOW};
@@ -257,6 +258,123 @@ impl JavaTest {
             });
         if rerun && self.running.is_none() {
             self.start(ctx);
+        }
+        open && !close
+    }
+}
+
+/// 用途檢查視窗：Server keystore / Client keystore / Truststore。
+pub struct RoleCheck {
+    ks: Keystore,
+    role: StoreRole,
+    host: String,
+    report: Option<RoleReport>,
+}
+
+impl RoleCheck {
+    pub fn new(ks: Keystore) -> Self {
+        let role = StoreRole::guess(&ks);
+        let mut r = RoleCheck {
+            ks,
+            role,
+            host: String::new(),
+            report: None,
+        };
+        r.run();
+        r
+    }
+
+    fn run(&mut self) {
+        let host = (self.role == StoreRole::Server).then_some(self.host.as_str());
+        self.report = Some(check_role(&self.ks, self.role, host, rustca_core::now_ts()));
+    }
+
+    /// 回傳 false 表示使用者關閉視窗。
+    pub fn ui(&mut self, ctx: &egui::Context) -> bool {
+        let mut open = true;
+        let mut close = false;
+        let mut rerun = false;
+        let max_h = max_window_height(ctx);
+        egui::Window::new(format!("☑ 用途檢查：{}", self.ks.name()))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(640.0)
+            .max_height(max_h)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("要當作：");
+                    for r in StoreRole::ALL {
+                        if ui.radio_value(&mut self.role, r, r.label()).changed() {
+                            rerun = true;
+                        }
+                    }
+                });
+                if self.role == StoreRole::Server {
+                    ui.horizontal(|ui| {
+                        ui.label("主機名稱（選填）");
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.host)
+                                .hint_text("例如 api.example.com，檢查憑證是否涵蓋")
+                                .desired_width(280.0),
+                        );
+                        if r.changed() {
+                            rerun = true;
+                        }
+                    });
+                }
+                ui.weak(match self.role {
+                    StoreRole::Server => "Server 提供 TLS 服務時用的 keystore：需有私鑰、完整憑證鏈、serverAuth 用途，SAN 要涵蓋主機名稱",
+                    StoreRole::Client => "mTLS 時 Client 送出憑證用的 keystore：需有私鑰、完整憑證鏈、clientAuth 用途",
+                    StoreRole::Truststore => "用來驗證對方憑證的信任庫：應放對方的 CA（根 / 中繼），不需要私鑰",
+                });
+                ui.separator();
+                if let Some(rep) = &self.report {
+                    let (text, color) = if !rep.ok {
+                        (format!("✘ 不適合作為 {}（{} 個錯誤、{} 個警告）", rep.role.label(), rep.errors, rep.warnings), RED)
+                    } else if rep.warnings > 0 {
+                        (format!("⚠ 可以作為 {}，但有 {} 個警告", rep.role.label(), rep.warnings), YELLOW)
+                    } else {
+                        (format!("✔ 適合作為 {}", rep.role.label()), GREEN)
+                    };
+                    ui.label(RichText::new(text).color(color).strong());
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height((max_h - 230.0).max(120.0))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (i, s) in rep.sections.iter().enumerate() {
+                                let bad = s.checks.iter().any(|c| c.level == CheckLevel::Error);
+                                let warn = s.checks.iter().any(|c| c.level == CheckLevel::Warn);
+                                let icon = if bad { "✘" } else if warn { "⚠" } else { "✔" };
+                                egui::CollapsingHeader::new(format!("{icon} {}", s.title))
+                                    .id_salt(("role_sec", i))
+                                    // 有問題的區段預設展開；區段很多時正常的收合
+                                    .default_open(bad || warn || rep.sections.len() <= 4)
+                                    .show(ui, |ui| {
+                                        for c in &s.checks {
+                                            let (icon, color) = match c.level {
+                                                CheckLevel::Ok => ("✔", GREEN),
+                                                CheckLevel::Warn => ("⚠", YELLOW),
+                                                CheckLevel::Error => ("✘", RED),
+                                            };
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(format!("{icon} {}", c.message))
+                                                        .color(color),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                    });
+                            }
+                        });
+                }
+                close = close_button(ui);
+            });
+        if rerun {
+            self.run();
         }
         open && !close
     }
