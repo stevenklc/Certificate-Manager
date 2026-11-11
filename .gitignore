@@ -1,13 +1,26 @@
+# ───────────── 建置產物 ─────────────
 /target
-/dist/
 **/*.rs.bk
+# 編譯好的 Windows 執行檔（由 scripts/build-windows.sh 產生，請用 Release 發佈而不是 commit）
+/dist/
+*.exe
+*.pdb
 
-# 憑證庫、私鑰與密碼檔一律不進版控（避免 commit secrets）
+# ───────────── 憑證庫、憑證、私鑰（避免 commit secrets）─────────────
+# Java / 通用憑證庫
 *.jks
 *.jceks
 *.keystore
+*.truststore
+*.ks
+*.bks
 *.p12
 *.pfx
+# IBM CMS 憑證庫與密碼 stash 檔
+*.kdb
+*.sth
+*.rdb
+# 憑證與私鑰
 *.pem
 *.key
 *.cer
@@ -15,14 +28,41 @@
 *.der
 *.csr
 *.p7b
+*.p7c
+*.p8
+*.pk8
+*.ppk
+*.crl
 *.srl
+# 本工具存檔前自動建立的備份（內容就是完整的憑證庫，例如 server.jks.20261111-153000.bak）
+*.bak
+
+# ───────────── 密碼與環境設定 ─────────────
 *password*
 *.secret
 .env
+.env.*
+*.env
+
+# ───────────── 測試資料 ─────────────
+# scripts/gen-test-fixtures.* 產生的示範 PKI
 /testdata/
 /fixtures/
 
-# IDE
+# ───────────── 記錄檔、截圖 ─────────────
+*.log
+# GUI 開發用自動截圖（RUST_CA_SCREENSHOT）
+/screenshots/
+
+# ───────────── IDE、AI 工具本機設定 ─────────────
 .idea/
 .vscode/
 *.iml
+.claude/settings.local.json
+
+# ───────────── 作業系統 ─────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
