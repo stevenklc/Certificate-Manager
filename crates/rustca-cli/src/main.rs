@@ -166,6 +166,15 @@ impl ClientIdArgs {
     fn load(&self) -> Result<Option<tls::Identity>> {
         if let Some(f) = &self.client {
             let ks = StoreOpener::with_password(self.client_password.clone()).open(f, true)?;
+            if ks.private_key_entries().next().is_none() {
+                bail!(
+                    "--client {} 沒有私鑰，不能作為 Client 身分。\
+                     Client 只有在 Server 要求 Client 憑證（mTLS）時才需要私鑰；\
+                     若要用它驗證 Server，請改用 --trust {}（本機模擬為 --client-trust）",
+                    f.display(),
+                    f.display()
+                );
+            }
             return Ok(Some(tls::identity_from_keystore(
                 &ks,
                 self.client_alias.as_deref(),

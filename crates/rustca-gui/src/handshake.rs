@@ -212,7 +212,15 @@ fn store_combo(
             ui.selectable_value(sel, None, "（無）");
             for (i, s) in stores.iter().enumerate() {
                 let n = s.private_key_entries().count();
-                ui.selectable_value(sel, Some(i), format!("{}（{} 個私鑰）", s.name(), n));
+                if n > 0 {
+                    ui.selectable_value(sel, Some(i), format!("{}（{n} 個私鑰）", s.name()));
+                } else {
+                    // 沒有私鑰的憑證庫（如 cacerts）只能當信任庫，不能當 TLS 身分
+                    ui.add_enabled(false, egui::Button::new(format!("{}（無私鑰）", s.name())))
+                        .on_disabled_hover_text(
+                            "沒有私鑰，不能作為身分；要用它驗證對方請勾選在「信任庫」",
+                        );
+                }
             }
         });
     if *sel != before {
@@ -220,6 +228,13 @@ fn store_combo(
     }
     if let Some(ks) = sel.and_then(|i| stores.get(i)) {
         let keys: Vec<String> = ks.private_key_entries().map(|e| e.alias.clone()).collect();
+        if keys.is_empty() {
+            ui.colored_label(
+                YELLOW,
+                "⚠ 沒有私鑰，不能作為身分（信任用的憑證庫請勾選在「信任庫」）",
+            );
+            return;
+        }
         if alias.is_none() {
             *alias = keys.first().cloned();
         }
@@ -277,6 +292,12 @@ fn identity(
 ) -> Result<Option<tls::Identity>, String> {
     match sel.and_then(|i| stores.get(i)) {
         None => Ok(None),
+        Some(ks) if ks.private_key_entries().next().is_none() => Err(format!(
+            "{what} 身分：{} 沒有私鑰，不能作為 TLS 身分。\
+             Client 一般不需要私鑰，只有 Server 要求 Client 憑證（mTLS）時才要；\
+             若要用它驗證對方的憑證，請把它勾選在「信任庫」，身分欄位選「（無）」",
+            ks.name()
+        )),
         Some(ks) => tls::identity_from_keystore(ks, alias.as_deref())
             .map(Some)
             .map_err(|e| format!("{what}：{e}")),
@@ -510,7 +531,8 @@ impl HandshakeState {
                                 ui.label(RichText::new("Server 身分").strong());
                                 self.server.ui(ui, "srv", stores, &mut self.open_requests);
                                 ui.end_row();
-                                ui.label(RichText::new("Client 信任庫").strong());
+                                ui.label(RichText::new("Client 信任庫").strong())
+                                    .on_hover_text("Client 用來驗證 Server 憑證的 CA，例如 cacerts");
                                 ui.vertical(|ui| {
                                     trust_checks(
                                         ui,
@@ -599,7 +621,7 @@ impl HandshakeState {
                                     }
                                 });
                                 ui.end_row();
-                                ui.label(RichText::new("Client 身分").strong());
+                                ui.label(RichText::new("Client 身分（選填）").strong());
                                 ui.vertical(|ui| {
                                     self.remote_client.ui(
                                         ui,
@@ -607,7 +629,7 @@ impl HandshakeState {
                                         stores,
                                         &mut self.open_requests,
                                     );
-                                    ui.weak("（Server 要求 Client 憑證 / mTLS 時使用）");
+                                    ui.weak("只有 Server 要求 Client 憑證（mTLS）時才需要，需含私鑰；一般 HTTPS 請留「（無）」。cacerts 之類的請選在上方「信任庫 → 指定檔案」");
                                 });
                                 ui.end_row();
                                 ui.label(RichText::new("Proxy").strong());
