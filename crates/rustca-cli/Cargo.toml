@@ -16,3 +16,4 @@ serde_json.workspace = true
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 comfy-table = "7"
 rpassword = "7"
+ratatui = "0.29"

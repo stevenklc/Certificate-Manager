@@ -4,6 +4,7 @@ mod console;
 mod manage;
 mod output;
 mod store;
+mod tui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -105,6 +106,18 @@ enum Cmd {
     /// 憑證庫管理：匯入、刪除、改名、更新憑證、修改密碼、轉換、匯出
     #[command(subcommand, alias = "m")]
     Manage(manage::ManageCmd),
+    /// 終端機互動介面（仿 k9s，可透過 SSH 使用，不需要圖形環境）
+    #[command(alias = "ui")]
+    Tui {
+        /// 要開啟的檔案或目錄（目錄會開啟第一層的憑證庫檔案）；也可以進入後按 o 開啟
+        files: Vec<PathBuf>,
+        /// 憑證庫密碼（未指定時會依序嘗試 changeit、不帶密碼，都不行才詢問）
+        #[arg(short, long, env = "RUST_CA_PASSWORD", hide_env_values = true)]
+        password: Option<String>,
+        /// 幾天內到期視為「即將到期」
+        #[arg(long, default_value_t = 30)]
+        warn_days: i64,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -329,6 +342,14 @@ fn main() -> ExitCode {
 
 fn run(cmd: Cmd, out: &Out) -> Result<u8> {
     match cmd {
+        Cmd::Tui {
+            files,
+            password,
+            warn_days,
+        } => {
+            tui::run(files, password, warn_days)?;
+            Ok(0)
+        }
         Cmd::List {
             files,
             pw,

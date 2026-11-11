@@ -12,6 +12,7 @@
 - **讀取格式**：JKS、JCEKS、PKCS#12（.p12/.pfx）、PEM、DER（.cer/.crt）、PKCS#7（.p7b）
   - JKS / JCEKS 會驗證完整性，並解密私鑰（Sun KeyProtector 與 PBEWithMD5AndTripleDES）
   - 沒有密碼也能列出憑證，只是不驗證完整性、不解密私鑰
+- **終端機介面（TUI）**：`rust-ca tui`，操作方式仿 k9s，透過 SSH（例如 MobaXterm）就能在 Linux 主機上使用，不需要 X11 或圖形環境；可瀏覽、篩選、跨檔搜尋、查看憑證鏈、到期檢查與遠端交握
 - **有效期限**：顯示生效日、到期日、剩餘天數；可設定「幾天內到期」的提醒門檻
 - **憑證鏈**：從終端憑證經中繼憑證一路組到根憑證，逐層驗證簽章，並檢查鏈是否完整、有沒有過期、CA 旗標是否正確；也可以拿其他檔案來補齊缺少的 CA
 - **簽發關係圖**（GUI）：選取任一憑證，畫出「誰簽發了它、它又簽發了哪些憑證」的樹狀圖，範圍涵蓋所有已開啟的檔案；連線顏色代表簽章驗證結果，點方框可看憑證內容或跳到所在條目；工具列的「🌳 簽發關係圖」以大畫面開啟，可切換只看目前條目或整個憑證庫（也可包含所有已開啟的檔案）
@@ -76,6 +77,15 @@ scripts/build-windows.sh
 ```
 
 產出的 exe 只依賴 Windows 10 以上內建的系統 DLL（含 UCRT），複製過去就能執行。
+
+### Linux 靜態執行檔（Oracle Linux / RHEL 7、8、9）
+
+一般在新版 Linux（例如 Ubuntu 24.04，glibc 2.39）編出來的執行檔，無法在 glibc 比較舊的主機上執行。改用 musl 靜態連結，產出的 `rust-ca` 不依賴任何系統函式庫，複製過去就能用（含 TUI）：
+
+```bash
+rustup target add x86_64-unknown-linux-musl   # 一次性準備；C 編譯器用系統的 gcc 即可
+scripts/build-linux.sh                        # 產出 dist/linux/rust-ca
+```
 
 ## CLI 使用方式
 
@@ -175,6 +185,21 @@ rust-ca manage java-test server.jks --java "C:\jdks"
 | 2 | 有憑證已過期（`expiry`） |
 | 10 | 執行錯誤（檔案不存在、密碼錯誤…） |
 
+## TUI 使用方式（終端機介面）
+
+```bash
+rust-ca tui /opt/app/conf/server.jks /usr/lib/jvm/java/lib/security/cacerts
+rust-ca tui /opt/app/conf/          # 目錄：開啟第一層的憑證庫檔案
+rust-ca tui                         # 先進入介面，再按 o 開檔（Tab 補齊路徑）
+```
+
+- 開檔時會依序嘗試 `-p` / `RUST_CA_PASSWORD`、已輸入過的密碼、`changeit`，都不對才詢問；也可以略過，只看憑證、不驗證完整性。
+- 主畫面左側是已開啟的檔案，右側是條目，下方是選取條目的摘要。常用按鍵：
+  `Enter` 詳細資料（憑證鏈分析、全部欄位、`p` 顯示 PEM、`w` 存檔）、`/` 篩選、`s` 搜尋全部檔案、`e` 到期檢查、`h` TLS 交握、`o` 開檔、`t` 依到期日排序、`?` 說明、`q` 離開。
+- 交握頁可選信任庫（作業系統憑證庫、Mozilla 根憑證，或已開啟的檔案如 cacerts）、Client 身分、Proxy（留空自動偵測，`none` 直連）、SNI、TLS 版本；結果可用 `w` 存成文字檔（`W` 另附憑證 PEM）。
+- 介面不攔截滑鼠，可以直接用終端機選取文字複製。
+- 需要 UTF-8 終端機；MobaXterm 預設即可正確顯示中文。
+
 ## GUI 使用方式
 
 1. 執行 `rust-ca-gui.exe`，把檔案拖進視窗，或按「📂 開啟檔案…」。需要密碼時會跳出輸入框。
@@ -209,9 +234,9 @@ scripts/gen-test-fixtures.sh            # Linux / WSL
 ```
 crates/
   rustca-core/   核心函式庫：格式解析、憑證資訊、憑證鏈、搜尋、TLS 模擬
-  rustca-cli/    命令列工具 rust-ca
+  rustca-cli/    命令列工具 rust-ca（含 TUI：src/tui/，使用 ratatui）
   rustca-gui/    圖形介面 rust-ca-gui（eframe / egui）
-scripts/         產生測試用憑證庫的腳本
+scripts/         建置腳本（Windows 交叉編譯、Linux 靜態執行檔）與產生測試用憑證庫的腳本
 ```
 
 ## 已知限制
