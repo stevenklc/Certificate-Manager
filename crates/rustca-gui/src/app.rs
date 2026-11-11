@@ -51,6 +51,8 @@ pub struct App {
     tree_selected: usize,
     /// 下一個 frame 要捲動到清單中的這個條目
     scroll_to: Option<(usize, usize)>,
+    /// 清單排序：(欄位, 是否升冪)；None＝原始順序
+    sort: Option<(SortCol, bool)>,
     /// 下方面板的中心條目：(中心, 當時清單選取的條目)。
     /// 從憑證鏈 / 關係圖跳到其他條目時保留原本的鏈；清單選取改變後自動失效。
     view_anchor: Option<((usize, usize), (usize, usize))>,
@@ -81,6 +83,7 @@ impl App {
             show_tree: false,
             tree_selected: 0,
             scroll_to: None,
+            sort: None,
             view_anchor: None,
             devshot: crate::devshot::DevShot::from_env(),
             dirty: Vec::new(),
@@ -422,6 +425,7 @@ impl App {
             cn: String,
             issuer: String,
             not_after: String,
+            not_after_ts: i64,
             status: Option<rustca_core::ValidityStatus>,
             key: &'static str,
             matched: String,
@@ -478,6 +482,7 @@ impl App {
                     not_after: leaf
                         .map(|c| format_ts(c.not_after).chars().take(10).collect())
                         .unwrap_or_default(),
+                    not_after_ts: leaf.map_or(i64::MAX, |c| c.not_after),
                     status: leaf.map(|c| c.status_at(now, self.warn_days)),
                     key: match e.key {
                         KeyState::None => "",
@@ -489,6 +494,36 @@ impl App {
             }
         }
 
+        if let Some((col, asc)) = self.sort {
+            use std::cmp::Ordering;
+            let text = |a: &str, b: &str| a.to_lowercase().cmp(&b.to_lowercase());
+            // 狀態：已過期 → 即將到期 → 尚未生效 → 有效，同狀態再依到期日
+            let rank = |r: &Row| match r.status {
+                Some(rustca_core::ValidityStatus::Expired { .. }) => 0,
+                Some(rustca_core::ValidityStatus::ExpiringSoon { .. }) => 1,
+                Some(rustca_core::ValidityStatus::NotYetValid { .. }) => 2,
+                Some(rustca_core::ValidityStatus::Valid { .. }) => 3,
+                None => 4,
+            };
+            rows.sort_by(|a, b| {
+                let o: Ordering = match col {
+                    SortCol::File => text(&a.file, &b.file),
+                    SortCol::Alias => text(&a.alias, &b.alias),
+                    SortCol::Kind => text(&a.kind, &b.kind),
+                    SortCol::Cn => text(&a.cn, &b.cn),
+                    SortCol::Issuer => text(&a.issuer, &b.issuer),
+                    SortCol::NotAfter => a.not_after_ts.cmp(&b.not_after_ts),
+                    SortCol::Status => (rank(a), a.not_after_ts).cmp(&(rank(b), b.not_after_ts)),
+                    SortCol::Key => a.key.cmp(b.key).reverse(),
+                    SortCol::Matched => text(&a.matched, &b.matched),
+                };
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
+            });
+        }
         let show_file = self.selected_store.is_none();
         let show_match = !matcher.is_empty();
         ui.horizontal(|ui| {
@@ -530,30 +565,45 @@ impl App {
         if let Some(i) = scroll_row {
             table = table.scroll_to_row(i, Some(egui::Align::Center));
         }
+        let sort = self.sort;
+        let mut sort_click = None;
+        let mut header = |h: &mut egui_extras::TableRow, t: &str, col: SortCol| {
+            h.col(|ui| {
+                let arrow = match sort {
+                    Some((c, true)) if c == col => " ▲",
+                    Some((c, false)) if c == col => " ▼",
+                    _ => "",
+                };
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(format!("{t}{arrow}")).strong())
+                            .frame(false),
+                    )
+                    .on_hover_text("點選排序：升冪 ▲ → 降冪 ▼ → 原始順序")
+                    .clicked()
+                {
+                    sort_click = Some(col);
+                }
+            });
+        };
         table
             .header(22.0, |mut h| {
                 if show_file {
-                    h.col(|ui| {
-                        ui.strong("檔案");
-                    });
+                    header(&mut h, "檔案", SortCol::File);
                 }
-                for t in [
-                    "別名",
-                    "類型",
-                    "主體 CN",
-                    "簽發者",
-                    "到期日",
-                    "狀態",
-                    "私鑰",
+                for (t, col) in [
+                    ("別名", SortCol::Alias),
+                    ("類型", SortCol::Kind),
+                    ("主體 CN", SortCol::Cn),
+                    ("簽發者", SortCol::Issuer),
+                    ("到期日", SortCol::NotAfter),
+                    ("狀態", SortCol::Status),
+                    ("私鑰", SortCol::Key),
                 ] {
-                    h.col(|ui| {
-                        ui.strong(t);
-                    });
+                    header(&mut h, t, col);
                 }
                 if show_match {
-                    h.col(|ui| {
-                        ui.strong("符合欄位");
-                    });
+                    header(&mut h, "符合欄位", SortCol::Matched);
                 }
             })
             .body(|body| {
@@ -608,6 +658,15 @@ impl App {
                     });
                 });
             });
+        if let Some(col) = sort_click {
+            self.sort = match self.sort {
+                Some((c, true)) if c == col => Some((col, false)),
+                Some((c, false)) if c == col => None,
+                _ => Some((col, true)),
+            };
+            // 排序後讓選取的條目保持在畫面中
+            self.scroll_to = self.selected_entry;
+        }
         if let Some(c) = clicked {
             self.view_anchor = None;
             if self.selected_entry != Some(c) {
@@ -1309,6 +1368,10 @@ impl eframe::App for App {
                         .unwrap_or(0);
                     self.selected_entry = Some((0, first));
                     match shot.tab.as_str() {
+                        "sort" => {
+                            self.selected_store = None;
+                            self.sort = Some((SortCol::NotAfter, false));
+                        }
                         "anchor" => {
                             // 模擬：以終端憑證為中心，從鏈中點到根憑證
                             let ks = &self.stores[0];
@@ -1527,4 +1590,18 @@ fn entry_menu(
             ui.weak("這張憑證只存在於憑證鏈中，不是獨立的條目");
         }
     }
+}
+
+/// 條目清單可排序的欄位。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortCol {
+    File,
+    Alias,
+    Kind,
+    Cn,
+    Issuer,
+    NotAfter,
+    Status,
+    Key,
+    Matched,
 }
