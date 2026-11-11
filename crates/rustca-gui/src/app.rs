@@ -51,6 +51,9 @@ pub struct App {
     tree_selected: usize,
     /// 下一個 frame 要捲動到清單中的這個條目
     scroll_to: Option<(usize, usize)>,
+    /// 下方面板的中心條目：(中心, 當時清單選取的條目)。
+    /// 從憑證鏈 / 關係圖跳到其他條目時保留原本的鏈；清單選取改變後自動失效。
+    view_anchor: Option<((usize, usize), (usize, usize))>,
     devshot: Option<crate::devshot::DevShot>,
     /// 與 stores 一一對應：是否有未儲存的變更
     dirty: Vec<bool>,
@@ -78,6 +81,7 @@ impl App {
             show_tree: false,
             tree_selected: 0,
             scroll_to: None,
+            view_anchor: None,
             devshot: crate::devshot::DevShot::from_env(),
             dirty: Vec::new(),
             dialog: None,
@@ -605,6 +609,7 @@ impl App {
                 });
             });
         if let Some(c) = clicked {
+            self.view_anchor = None;
             if self.selected_entry != Some(c) {
                 self.selected_entry = Some(c);
                 self.selected_link = 0;
@@ -628,9 +633,26 @@ impl App {
     }
 
     fn detail_panel(&mut self, ctx: &egui::Context) {
-        let Some((si, ei)) = self.selected_entry else {
+        let Some(sel) = self.selected_entry else {
             return;
         };
+        let (si, ei) = match self.view_anchor {
+            Some((a, s))
+                if s == sel && self.stores.get(a.0).is_some_and(|k| a.1 < k.entries.len()) =>
+            {
+                a
+            }
+            _ => sel,
+        };
+        let sel_alias = (sel != (si, ei))
+            .then(|| {
+                self.stores
+                    .get(sel.0)?
+                    .entries
+                    .get(sel.1)
+                    .map(|e| e.alias.clone())
+            })
+            .flatten();
         let Some(entry) = self.stores.get(si).and_then(|s| s.entries.get(ei)) else {
             self.selected_entry = None;
             return;
@@ -668,6 +690,7 @@ impl App {
         let mut tree_click = None;
         let mut goto = None;
         let mut menu_act = None;
+        let mut recenter = false;
         let entry = &self.stores[si].entries[ei];
         let mut select_link = None;
         let mut copy = None;
@@ -685,6 +708,17 @@ impl App {
                         ui.weak(format!("· 建立於 {}", format_ts(ts)));
                     }
                 });
+                if let Some(a) = &sel_alias {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            BLUE,
+                            format!("清單中選取的是「{a}」（已在下方標示），這裡仍以「{}」為中心顯示", entry.alias),
+                        );
+                        if ui.small_button(format!("改以「{a}」為中心")).clicked() {
+                            recenter = true;
+                        }
+                    });
+                }
                 ui.separator();
                 ui.columns(2, |cols| {
                     // 左：憑證鏈
@@ -727,7 +761,7 @@ impl App {
                                 tree_click = r.clicked;
                                 if let Some(i) = r.double_clicked {
                                     goto = find(&tree.nodes[i].cert.sha256)
-                                        .filter(|x| *x != (si, ei));
+                                        .filter(|x| Some(*x) != self.selected_entry);
                                 }
                                 ui.add_space(4.0);
                                 if let Some(m) = &tree.missing_issuer {
@@ -776,14 +810,16 @@ impl App {
                                         self.find_cert(&l.cert.sha256, si)
                                     };
                                     let r = ui.selectable_label(self.selected_link == i, text);
-                                    let r = if loc.is_some_and(|x| x != (si, ei)) {
+                                    let r = if loc.is_some_and(|x| Some(x) != self.selected_entry) {
                                         r.on_hover_text("點選跳到這張憑證的條目；右鍵可管理")
                                     } else {
                                         r
                                     };
                                     if r.clicked() {
                                         match loc {
-                                            Some(x) if x != (si, ei) => goto = Some(x),
+                                            Some(x) if Some(x) != self.selected_entry => {
+                                                goto = Some(x)
+                                            }
                                             _ => select_link = Some(i),
                                         }
                                     }
@@ -908,8 +944,26 @@ impl App {
             ctx.copy_text(text);
             self.info("已複製 PEM 到剪貼簿");
         }
+        if recenter {
+            self.view_anchor = None;
+            self.selected_link = 0;
+            self.tree_selected = usize::MAX;
+        }
         if let Some(loc) = goto {
+            // 保留目前的中心，只在清單中選取並標示該憑證
             self.jump_to(loc);
+            self.view_anchor = (loc != (si, ei)).then_some(((si, ei), loc));
+            let sha = self.stores[loc.0].entries[loc.1]
+                .leaf()
+                .map(|c| c.sha256.clone());
+            if let (Some(sha), Some((_, chain, tree))) = (sha, &self.chain_cache) {
+                if let Some(i) = chain.links.iter().position(|l| l.cert.sha256 == sha) {
+                    self.selected_link = i;
+                }
+                if let Some(n) = tree.nodes.iter().position(|n| n.cert.sha256 == sha) {
+                    self.tree_selected = n;
+                }
+            }
         }
         if let Some((s, e, a)) = menu_act {
             self.entry_act(s, e, a);
@@ -1255,6 +1309,21 @@ impl eframe::App for App {
                         .unwrap_or(0);
                     self.selected_entry = Some((0, first));
                     match shot.tab.as_str() {
+                        "anchor" => {
+                            // 模擬：以終端憑證為中心，從鏈中點到根憑證
+                            let ks = &self.stores[0];
+                            let leaf = ks.entries.iter().position(|e| e.chain.len() > 2);
+                            let root = ks
+                                .entries
+                                .iter()
+                                .position(|e| e.leaf().is_some_and(|c| c.self_signed));
+                            if let (Some(l), Some(r)) = (leaf, root) {
+                                self.selected_store = None;
+                                self.selected_entry = Some((0, r));
+                                self.view_anchor = Some(((0, l), (0, r)));
+                                self.selected_link = 2;
+                            }
+                        }
                         "tree" => {
                             self.selected_store = None;
                             self.show_tree = true;

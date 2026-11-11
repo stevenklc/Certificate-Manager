@@ -1,7 +1,7 @@
 //! 開發用：自動截圖（僅 debug build）。
 //! RUST_CA_SCREENSHOT=out.png       截圖輸出路徑
 //! RUST_CA_SCREENSHOT_TAB=handshake 切到交握分頁並執行本機模擬
-//!   tree：顯示簽發關係圖
+//!   tree：顯示簽發關係圖；anchor：以終端憑證為中心並選取根憑證
 //!   gen / java / convert：開啟「製作憑證鏈」/「Java 相容性測試」/「轉換憑證格式」
 
 use eframe::egui;
