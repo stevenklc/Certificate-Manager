@@ -296,3 +296,33 @@ fn issuance_tree_shows_issuers_and_issued() {
     assert_eq!(tree.nodes.len(), 4);
     assert!(tree.nodes[0].is_target);
 }
+
+#[test]
+fn check_key_password_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    // JKS：私鑰密碼與憑證庫不同，存檔後以原始加密資料檢查
+    let (mut ks, _) = make_store(&dir.path().join("k.jks"), StoreFormat::Jks);
+    edit::set_key_password(&mut ks, "server", "key-secret").unwrap();
+    // 尚未存檔：與目前生效的密碼比對
+    assert!(edit::check_key_password(&ks, "server", "key-secret").unwrap());
+    assert!(!edit::check_key_password(&ks, "server", PW).unwrap());
+    edit::save(&mut ks, None, None, false).unwrap();
+    // 只給憑證庫密碼開啟 → 私鑰鎖住，仍可驗證並解開
+    let mut back = load_file(&ks.path, &LoadOptions::with_password(PW)).unwrap();
+    assert!(matches!(
+        back.entry("server").unwrap().key,
+        KeyState::Locked(_)
+    ));
+    assert!(!edit::check_key_password(&back, "server", "wrong-pw").unwrap());
+    assert!(edit::check_key_password(&back, "server", "key-secret").unwrap());
+    edit::unlock_entry(&mut back, "server", "key-secret").unwrap();
+    // 信任憑證沒有私鑰密碼
+    assert!(edit::check_key_password(&back, "root", PW).is_err());
+
+    // PKCS#12：私鑰密碼等於憑證庫密碼
+    let (mut p12, _) = make_store(&dir.path().join("k.p12"), StoreFormat::Pkcs12);
+    edit::save(&mut p12, None, None, false).unwrap();
+    let back = load_file(&p12.path, &LoadOptions::with_password(PW)).unwrap();
+    assert!(edit::check_key_password(&back, "server", PW).unwrap());
+    assert!(!edit::check_key_password(&back, "server", "nope").unwrap());
+}

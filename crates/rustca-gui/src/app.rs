@@ -49,6 +49,8 @@ pub struct App {
     /// 詳細面板左側顯示簽發關係圖（否則顯示憑證鏈）
     show_tree: bool,
     tree_selected: usize,
+    /// 下一個 frame 要捲動到清單中的這個條目
+    scroll_to: Option<(usize, usize)>,
     devshot: Option<crate::devshot::DevShot>,
     /// 與 stores 一一對應：是否有未儲存的變更
     dirty: Vec<bool>,
@@ -75,6 +77,7 @@ impl App {
             chain_cache: None,
             show_tree: false,
             tree_selected: 0,
+            scroll_to: None,
             devshot: crate::devshot::DevShot::from_env(),
             dirty: Vec::new(),
             dialog: None,
@@ -492,7 +495,13 @@ impl App {
         });
 
         let mut clicked = None;
+        let mut menu_act = None;
         let selected = self.selected_entry;
+        let stores = &self.stores;
+        let scroll_row = self
+            .scroll_to
+            .take()
+            .and_then(|t| rows.iter().position(|r| (r.store, r.entry) == t));
         let mut table = TableBuilder::new(ui)
             .id_salt("entries")
             .striped(true)
@@ -513,6 +522,9 @@ impl App {
             .column(Column::exact(36.0));
         if show_match {
             table = table.column(Column::remainder());
+        }
+        if let Some(i) = scroll_row {
+            table = table.scroll_to_row(i, Some(egui::Align::Center));
         }
         table
             .header(22.0, |mut h| {
@@ -577,9 +589,19 @@ impl App {
                             ui.colored_label(BLUE, &r.matched);
                         });
                     }
-                    if row.response().clicked() {
+                    let resp = row.response();
+                    if resp.clicked() || resp.secondary_clicked() {
                         clicked = Some((r.store, r.entry));
                     }
+                    resp.context_menu(|ui| {
+                        if let Some(e) = stores.get(r.store).and_then(|s| s.entries.get(r.entry)) {
+                            ui.weak(format!("條目「{}」", e.alias));
+                            ui.separator();
+                            if let Some(a) = entry_actions(ui, &stores[r.store], e, true) {
+                                menu_act = Some((r.store, r.entry, a));
+                            }
+                        }
+                    });
                 });
             });
         if let Some(c) = clicked {
@@ -589,6 +611,20 @@ impl App {
                 self.tree_selected = usize::MAX;
             }
         }
+        if let Some((si, ei, a)) = menu_act {
+            self.entry_act(si, ei, a);
+        }
+    }
+
+    /// 跳到某個條目：在清單中選取並捲動過去。
+    fn jump_to(&mut self, (s, e): (usize, usize)) {
+        if self.selected_store.is_some() {
+            self.selected_store = Some(s);
+        }
+        self.selected_entry = Some((s, e));
+        self.selected_link = 0;
+        self.tree_selected = usize::MAX;
+        self.scroll_to = Some((s, e));
     }
 
     fn detail_panel(&mut self, ctx: &egui::Context) {
@@ -631,6 +667,7 @@ impl App {
         let mut show_tree = self.show_tree;
         let mut tree_click = None;
         let mut goto = None;
+        let mut menu_act = None;
         let entry = &self.stores[si].entries[ei];
         let mut select_link = None;
         let mut copy = None;
@@ -665,13 +702,33 @@ impl App {
                             .id_salt("tree")
                             .auto_shrink([false, false])
                             .show(&mut cols[0], |ui| {
-                                tree_click = crate::graph::tree_ui(
+                                let stores = &self.stores;
+                                let find = |sha: &str| {
+                                    if stores[si].entries[ei]
+                                        .leaf()
+                                        .is_some_and(|c| c.sha256 == sha)
+                                    {
+                                        Some((si, ei))
+                                    } else {
+                                        self.find_cert(sha, si)
+                                    }
+                                };
+                                let r = crate::graph::tree_ui(
                                     ui,
                                     tree,
                                     self.tree_selected,
                                     &locations,
                                     self.warn_days,
+                                    &mut |ui, i| {
+                                        let loc = find(&tree.nodes[i].cert.sha256);
+                                        entry_menu(ui, stores, loc, &mut menu_act);
+                                    },
                                 );
+                                tree_click = r.clicked;
+                                if let Some(i) = r.double_clicked {
+                                    goto = find(&tree.nodes[i].cert.sha256)
+                                        .filter(|x| *x != (si, ei));
+                                }
                                 ui.add_space(4.0);
                                 if let Some(m) = &tree.missing_issuer {
                                     ui.colored_label(
@@ -712,10 +769,27 @@ impl App {
                                         "[{i}] {} · {role}",
                                         l.cert.display_name()
                                     ));
-                                    if ui.selectable_label(self.selected_link == i, text).clicked()
-                                    {
-                                        select_link = Some(i);
+                                    // 這張憑證所在的條目（i == 0 就是目前條目）
+                                    let loc = if i == 0 {
+                                        Some((si, ei))
+                                    } else {
+                                        self.find_cert(&l.cert.sha256, si)
+                                    };
+                                    let r = ui.selectable_label(self.selected_link == i, text);
+                                    let r = if loc.is_some_and(|x| x != (si, ei)) {
+                                        r.on_hover_text("點選跳到這張憑證的條目；右鍵可管理")
+                                    } else {
+                                        r
+                                    };
+                                    if r.clicked() {
+                                        match loc {
+                                            Some(x) if x != (si, ei) => goto = Some(x),
+                                            _ => select_link = Some(i),
+                                        }
                                     }
+                                    r.context_menu(|ui| {
+                                        entry_menu(ui, &self.stores, loc, &mut menu_act);
+                                    });
                                     match l.signature_ok {
                                         Some(true) => ui.colored_label(GREEN, "✔"),
                                         Some(false) => ui.colored_label(RED, "✘ 簽章"),
@@ -814,14 +888,6 @@ impl App {
         if let Some(i) = tree_click {
             self.tree_selected = i;
         }
-        if let Some((s, e)) = goto {
-            if self.selected_store.is_some() {
-                self.selected_store = Some(s);
-            }
-            self.selected_entry = Some((s, e));
-            self.selected_link = 0;
-            self.tree_selected = usize::MAX;
-        }
         if let Some(i) = select_link {
             self.selected_link = i;
         }
@@ -842,6 +908,12 @@ impl App {
             ctx.copy_text(text);
             self.info("已複製 PEM 到剪貼簿");
         }
+        if let Some(loc) = goto {
+            self.jump_to(loc);
+        }
+        if let Some((s, e, a)) = menu_act {
+            self.entry_act(s, e, a);
+        }
     }
 
     /// 目前操作的憑證庫：選取條目所在的檔案，否則為左側選取的檔案。
@@ -850,6 +922,56 @@ impl App {
         self.selected_store
             .or(self.selected_entry.map(|(s, _)| s))
             .filter(|i| *i < self.stores.len())
+    }
+
+    /// 執行條目動作（工具列與右鍵選單共用）。
+    fn entry_act(&mut self, si: usize, ei: usize, act: EntryAct) {
+        let Some(e) = self.stores.get(si).and_then(|s| s.entries.get(ei)) else {
+            return;
+        };
+        let alias = e.alias.clone();
+        let kind = match act {
+            EntryAct::Rename => Kind::Rename {
+                store: si,
+                old: alias.clone(),
+                new: alias,
+            },
+            EntryAct::UpdateCert => Kind::UpdateCert {
+                store: si,
+                alias,
+                file: None,
+                file_pw: String::new(),
+            },
+            EntryAct::KeyPass => Kind::KeyPass {
+                store: si,
+                alias,
+                current: String::new(),
+                new: String::new(),
+                new2: String::new(),
+            },
+            EntryAct::CheckKeyPass => Kind::CheckKeyPass {
+                store: si,
+                alias,
+                pw: String::new(),
+            },
+            EntryAct::Delete => Kind::Delete { store: si, alias },
+            EntryAct::VerifyChain => {
+                match edit::verify_entry(&self.stores[si], &alias, now_ts()) {
+                    Ok(v) => self.verify_view = Some(v),
+                    Err(e) => self.error(e.to_string()),
+                }
+                return;
+            }
+            EntryAct::Export => {
+                match manage::export_entry(e, true) {
+                    Ok(Some(m)) => self.info(m),
+                    Ok(None) => {}
+                    Err(m) => self.error(m),
+                }
+                return;
+            }
+        };
+        self.dialog = Some(kind.into());
     }
 
     fn manage_bar(&mut self, ui: &mut egui::Ui) {
@@ -867,9 +989,7 @@ impl App {
             .and_then(|(_, e)| ks.entries.get(e));
         let mut open: Option<Kind> = None;
         let mut save = false;
-        let mut export = None;
         let mut java = false;
-        let mut verify = None;
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!("🛠 {}", ks.name()));
             if !writable {
@@ -961,79 +1081,11 @@ impl App {
                 java = true;
             }
         });
+        let mut act = None;
         if let Some(e) = entry {
-            let alias = e.alias.clone();
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("條目「{alias}」：")).strong());
-                if ui
-                    .add_enabled(can_edit, egui::Button::new("✏ 改名"))
-                    .clicked()
-                {
-                    open = Some(Kind::Rename {
-                        store: si,
-                        old: alias.clone(),
-                        new: alias.clone(),
-                    });
-                }
-                if ui
-                    .add_enabled(
-                        can_edit && e.kind != EntryKind::SecretKey,
-                        egui::Button::new("🔄 替換憑證鏈"),
-                    )
-                    .on_hover_text(
-                        "同一別名替換憑證 / 憑證鏈（續約、匯入 CA 回覆），替換後自動驗證",
-                    )
-                    .clicked()
-                {
-                    open = Some(Kind::UpdateCert {
-                        store: si,
-                        alias: alias.clone(),
-                        file: None,
-                        file_pw: String::new(),
-                    });
-                }
-                if ui
-                    .add_enabled(
-                        can_edit
-                            && e.kind == EntryKind::PrivateKey
-                            && ks.format != StoreFormat::Pkcs12,
-                        egui::Button::new("🔑 改私鑰密碼"),
-                    )
-                    .clicked()
-                {
-                    open = Some(Kind::KeyPass {
-                        store: si,
-                        alias: alias.clone(),
-                        current: String::new(),
-                        new: String::new(),
-                        new2: String::new(),
-                    });
-                }
-                if ui
-                    .add_enabled(!e.chain.is_empty(), egui::Button::new("✅ 驗證憑證鏈"))
-                    .on_hover_text("檢查私鑰相符、順序、簽章、有效期限與根憑證")
-                    .clicked()
-                {
-                    verify = Some(alias.clone());
-                }
-                if ui
-                    .add_enabled(!e.chain.is_empty(), egui::Button::new("📤 匯出憑證鏈…"))
-                    .clicked()
-                {
-                    export = Some(e.clone());
-                }
-                if ui
-                    .add_enabled(
-                        can_edit,
-                        egui::Button::new(RichText::new("🗑 刪除").color(RED)),
-                    )
-                    .clicked()
-                {
-                    open = Some(Kind::Delete {
-                        store: si,
-                        alias: alias.clone(),
-                    });
-                }
+                ui.label(RichText::new(format!("條目「{}」：", e.alias)).strong());
+                act = entry_actions(ui, ks, e, false);
             });
         }
         if let Some(k) = open {
@@ -1054,18 +1106,8 @@ impl App {
             t.start(ui.ctx());
             self.java_test = Some(t);
         }
-        if let Some(a) = verify {
-            match edit::verify_entry(&self.stores[si], &a, now_ts()) {
-                Ok(v) => self.verify_view = Some(v),
-                Err(e) => self.error(e.to_string()),
-            }
-        }
-        if let Some(e) = export {
-            match manage::export_entry(&e, true) {
-                Ok(Some(m)) => self.info(m),
-                Ok(None) => {}
-                Err(m) => self.error(m),
-            }
+        if let (Some(a), Some((_, ei))) = (act, self.selected_entry) {
+            self.entry_act(si, ei, a);
         }
     }
 
@@ -1301,6 +1343,119 @@ impl eframe::App for App {
         // 讓交握執行緒結束時能更新畫面
         if self.hs.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// 單一條目可執行的動作。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryAct {
+    Rename,
+    UpdateCert,
+    KeyPass,
+    CheckKeyPass,
+    VerifyChain,
+    Export,
+    Delete,
+}
+
+/// 條目動作按鈕；`menu` 為 true 時用於右鍵選單（點選後關閉選單）。
+fn entry_actions(
+    ui: &mut egui::Ui,
+    ks: &Keystore,
+    e: &rustca_core::Entry,
+    menu: bool,
+) -> Option<EntryAct> {
+    let can_edit = edit::is_writable(ks.format) && ks.store_password.is_some();
+    let is_key = e.kind == EntryKind::PrivateKey;
+    let has_chain = !e.chain.is_empty();
+    let edit_hint = if !edit::is_writable(ks.format) {
+        "此格式為唯讀，請先「另存新檔」轉成 JKS / PKCS#12"
+    } else {
+        "憑證庫未以密碼開啟，請先按左側「解鎖」"
+    };
+    let key_off = if !is_key {
+        "只有私鑰條目有私鑰密碼"
+    } else if ks.format == StoreFormat::Pkcs12 {
+        "PKCS#12 的私鑰密碼等於憑證庫密碼，請用「改憑證庫密碼」"
+    } else {
+        edit_hint
+    };
+    // (動作, 可用, 文字, 可用時提示, 停用時提示)
+    let items: [(EntryAct, bool, RichText, &str, &str); 7] = [
+        (EntryAct::Rename, can_edit, "✏ 改名".into(), "", edit_hint),
+        (
+            EntryAct::UpdateCert,
+            can_edit && e.kind != EntryKind::SecretKey,
+            "🔄 替換憑證鏈".into(),
+            "同一別名替換憑證 / 憑證鏈（續約、匯入 CA 回覆），替換後自動驗證",
+            edit_hint,
+        ),
+        (
+            EntryAct::KeyPass,
+            can_edit && is_key && ks.format != StoreFormat::Pkcs12,
+            "🔑 改私鑰密碼".into(),
+            "",
+            key_off,
+        ),
+        (
+            EntryAct::CheckKeyPass,
+            is_key,
+            "🔍 驗證私鑰密碼".into(),
+            "輸入密碼，檢查是否為這把私鑰的 key pass",
+            "只有私鑰條目有私鑰密碼",
+        ),
+        (
+            EntryAct::VerifyChain,
+            has_chain,
+            "✅ 驗證憑證鏈".into(),
+            "檢查私鑰相符、順序、簽章、有效期限與根憑證",
+            "",
+        ),
+        (EntryAct::Export, has_chain, "📤 匯出憑證鏈…".into(), "", ""),
+        (
+            EntryAct::Delete,
+            can_edit,
+            RichText::new("🗑 刪除").color(RED),
+            "",
+            edit_hint,
+        ),
+    ];
+    let mut act = None;
+    for (a, enabled, label, on, off) in items {
+        let mut r = ui.add_enabled(enabled, egui::Button::new(label));
+        if enabled && !on.is_empty() {
+            r = r.on_hover_text(on);
+        } else if !enabled && !off.is_empty() {
+            r = r.on_disabled_hover_text(off);
+        }
+        if r.clicked() {
+            act = Some(a);
+            if menu {
+                ui.close_menu();
+            }
+        }
+    }
+    act
+}
+
+/// 右鍵選單：顯示某個條目可用的動作；`loc` 為 None 表示這張憑證不是獨立條目。
+fn entry_menu(
+    ui: &mut egui::Ui,
+    stores: &[Keystore],
+    loc: Option<(usize, usize)>,
+    out: &mut Option<(usize, usize, EntryAct)>,
+) {
+    match loc.and_then(|(s, e)| Some((s, e, stores.get(s)?, stores.get(s)?.entries.get(e)?))) {
+        Some((s, e, ks, entry)) => {
+            ui.weak(format!("{} / {}", ks.name(), entry.alias));
+            ui.separator();
+            if let Some(a) = entry_actions(ui, ks, entry, true) {
+                *out = Some((s, e, a));
+            }
+        }
+        None => {
+            ui.weak("這張憑證只存在於憑證鏈中，不是獨立的條目");
         }
     }
 }

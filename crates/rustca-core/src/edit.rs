@@ -305,6 +305,35 @@ pub fn unlock_entry(ks: &mut Keystore, alias: &str, password: &str) -> Result<()
     Ok(())
 }
 
+/// 檢查某條目的私鑰密碼（key pass）是否正確，不修改憑證庫。
+///
+/// JKS / JCEKS 以原始加密資料實際解密；沒有原始資料時（PKCS#12、已改過密碼或新匯入的私鑰）
+/// 與目前生效的密碼比對。
+pub fn check_key_password(ks: &Keystore, alias: &str, password: &str) -> Result<bool> {
+    let e = ks
+        .entry(alias)
+        .ok_or_else(|| Error::Other(format!("找不到別名「{alias}」")))?;
+    if e.kind != EntryKind::PrivateKey {
+        return Err(Error::Other(format!(
+            "「{alias}」不是私鑰條目，沒有私鑰密碼"
+        )));
+    }
+    if let Some(blob) = &e.protected {
+        return Ok(crate::jks::decrypt_key(blob, password).is_ok());
+    }
+    let current = if ks.format == StoreFormat::Pkcs12 {
+        ks.store_password.as_ref()
+    } else {
+        e.key_password.as_ref().or(ks.store_password.as_ref())
+    };
+    match current {
+        Some(c) if matches!(e.key, KeyState::Decrypted { .. }) => Ok(c.expose() == password),
+        _ => Err(Error::NeedPassword(
+            "憑證庫未以密碼開啟，無法比對私鑰密碼，請先解鎖".into(),
+        )),
+    }
+}
+
 /// 修改某條目的私鑰密碼（PKCS#12 的私鑰密碼固定等於憑證庫密碼）。
 pub fn set_key_password(ks: &mut Keystore, alias: &str, new: &str) -> Result<()> {
     if ks.format == StoreFormat::Pkcs12 {

@@ -60,6 +60,12 @@ pub enum Kind {
         new: String,
         new2: String,
     },
+    /// 驗證私鑰密碼是否正確
+    CheckKeyPass {
+        store: usize,
+        alias: String,
+        pw: String,
+    },
     StorePass {
         store: usize,
         new: String,
@@ -382,6 +388,24 @@ pub fn apply(kind: &Kind, stores: &mut [Keystore]) -> Result<Effect, String> {
                 *store,
                 format!("已修改「{alias}」的私鑰密碼"),
             ))
+        }
+        Kind::CheckKeyPass { store, alias, pw } => {
+            let ks = &mut stores[*store];
+            if edit::check_key_password(ks, alias, pw).map_err(s)? {
+                let locked = ks
+                    .entry(alias)
+                    .is_some_and(|e| matches!(e.key, KeyState::Locked(_)));
+                if locked {
+                    edit::unlock_entry(ks, alias, pw).map_err(s)?;
+                    Ok(Effect::Done(format!(
+                        "✔「{alias}」的私鑰密碼正確，私鑰已解開"
+                    )))
+                } else {
+                    Ok(Effect::Done(format!("✔「{alias}」的私鑰密碼正確")))
+                }
+            } else {
+                Err(format!("✘「{alias}」的私鑰密碼不正確"))
+            }
         }
         Kind::StorePass {
             store,
@@ -805,6 +829,7 @@ fn title(kind: &Kind) -> &'static str {
         Kind::Rename { .. } => "✏ 修改別名",
         Kind::UpdateCert { .. } => "🔄 更新憑證",
         Kind::KeyPass { .. } => "🔑 修改私鑰密碼（key pass）",
+        Kind::CheckKeyPass { .. } => "🔍 驗證私鑰密碼（key pass）",
         Kind::StorePass { .. } => "🔐 修改憑證庫密碼（store pass）",
         Kind::Delete { .. } => "🗑 刪除條目",
         Kind::SaveAs { .. } => "💾 另存新檔 / 轉換格式",
@@ -960,6 +985,19 @@ pub fn show(d: &mut Dialog, ctx: &egui::Context, stores: &[Keystore]) -> Option<
                         }
                         pw_field(ui, "新私鑰密碼", new, "至少 6 個字元");
                         pw_field(ui, "再次輸入", new2, "");
+                    }
+                    Kind::CheckKeyPass { store, alias, pw } => {
+                        ui.label("憑證庫");
+                        ui.strong(store_name(store));
+                        ui.end_row();
+                        ui.label("別名");
+                        ui.strong(alias.as_str());
+                        ui.end_row();
+                        pw_field(ui, "私鑰密碼", pw, "要檢查的 key pass");
+                        ui.label("");
+                        ui.weak("只檢查，不會修改憑證庫；若私鑰尚未解密，密碼正確時會順便解開");
+                        ui.end_row();
+                        ok_label = "驗證";
                     }
                     Kind::StorePass {
                         store,

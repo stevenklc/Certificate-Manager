@@ -19,14 +19,21 @@ const MARGIN: f32 = 8.0;
 /// 憑證位置：sha256 → 「檔案 / 別名」清單。
 pub type Locations = HashMap<String, Vec<String>>;
 
-/// 畫出關係圖；回傳被點選的節點索引。
+#[derive(Default)]
+pub struct TreeResponse {
+    pub clicked: Option<usize>,
+    pub double_clicked: Option<usize>,
+}
+
+/// 畫出關係圖；`menu` 為節點的右鍵選單內容。
 pub fn tree_ui(
     ui: &mut egui::Ui,
     tree: &IssuanceTree,
     selected: usize,
     locations: &Locations,
     warn_days: i64,
-) -> Option<usize> {
+    menu: &mut dyn FnMut(&mut egui::Ui, usize),
+) -> TreeResponse {
     let now = now_ts();
     let max_depth = tree.nodes.iter().map(|n| n.depth).max().unwrap_or(0);
     let size = Vec2::new(
@@ -75,7 +82,7 @@ pub fn tree_ui(
         }
     }
 
-    let mut clicked = None;
+    let mut out = TreeResponse::default();
     for (i, n) in tree.nodes.iter().enumerate() {
         let r = rect_of(i);
         let resp = ui.interact(r, ui.id().with(("tree_node", i)), Sense::click());
@@ -176,12 +183,17 @@ pub fn tree_ui(
             if let Some(v) = locations.get(&n.cert.sha256) {
                 ui.label(format!("位置：{}", v.join("、")));
             }
+            ui.weak("點兩下跳到所在條目；右鍵可管理");
         });
-        if resp.clicked() {
-            clicked = Some(i);
+        if resp.clicked() || resp.secondary_clicked() {
+            out.clicked = Some(i);
         }
+        if resp.double_clicked() {
+            out.double_clicked = Some(i);
+        }
+        resp.context_menu(|ui| menu(ui, i));
     }
-    clicked
+    out
 }
 
 fn one_line(text: String, font: FontId, color: Color32, width: f32) -> LayoutJob {
