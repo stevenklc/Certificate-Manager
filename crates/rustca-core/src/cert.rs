@@ -220,6 +220,16 @@ impl CertInfo {
         })
     }
 
+    /// 憑證在 PKI 中的角色（與它在憑證庫中是哪一種條目無關）。
+    pub fn role(&self) -> &'static str {
+        match (self.is_ca, self.self_signed) {
+            (true, true) => "根 CA",
+            (true, false) => "中繼 CA",
+            (false, true) => "自簽",
+            (false, false) => "終端",
+        }
+    }
+
     /// 顯示用名稱：優先使用 CN，否則使用完整主體。
     pub fn display_name(&self) -> String {
         self.subject_cn

@@ -19,7 +19,9 @@ pub mod search;
 pub mod tls;
 
 pub use cert::{format_ts, init_local_offset, now_ts, parse_date, CertInfo, ValidityStatus};
-pub use chain::{build_chain, BuiltChain, ChainEnd, ChainLink};
+pub use chain::{
+    build_chain, issuance_tree, BuiltChain, ChainEnd, ChainLink, IssuanceTree, TreeNode,
+};
 pub use error::{Error, Result};
 pub use loader::{detect_format, load_bytes, load_file, LoadOptions};
 pub use model::{Entry, EntryKind, Integrity, KeyFormat, KeyState, Keystore, Secret, StoreFormat};

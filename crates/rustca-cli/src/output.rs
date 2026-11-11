@@ -163,7 +163,7 @@ impl Out {
                         t.add_row(vec![
                             Cell::new(i + 1),
                             Cell::new(&e.alias),
-                            Cell::new(format!("{}{}", e.kind, chain_suffix(e))),
+                            Cell::new(format!("{} · {}{}", e.kind, c.role(), chain_suffix(e))),
                             Cell::new(c.display_name()),
                             Cell::new(issuer),
                             Cell::new(format_ts(c.not_after)),
@@ -690,6 +690,7 @@ fn entry_json(e: &Entry, now: i64, warn_days: i64) -> Value {
     json!({
         "alias": e.alias,
         "kind": e.kind,
+        "role": e.leaf().map(|c| c.role()),
         "created": e.created,
         "key": e.key.label(),
         "note": e.note,

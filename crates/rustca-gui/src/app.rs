@@ -6,8 +6,8 @@ use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use rustca_core::chain::LinkSource;
 use rustca_core::{
-    build_chain, edit, format_ts, load_file, now_ts, BuiltChain, CertInfo, ChainEnd, EntryKind,
-    KeyState, Keystore, LoadOptions, Matcher, StoreFormat,
+    build_chain, edit, format_ts, issuance_tree, load_file, now_ts, BuiltChain, CertInfo, ChainEnd,
+    EntryKind, IssuanceTree, KeyState, Keystore, LoadOptions, Matcher, StoreFormat,
 };
 
 use crate::handshake::HandshakeState;
@@ -45,7 +45,10 @@ pub struct App {
     queue: Vec<PathBuf>,
     message: Option<(String, bool)>,
     hs: HandshakeState,
-    chain_cache: Option<((usize, usize), BuiltChain)>,
+    chain_cache: Option<((usize, usize), BuiltChain, IssuanceTree)>,
+    /// 詳細面板左側顯示簽發關係圖（否則顯示憑證鏈）
+    show_tree: bool,
+    tree_selected: usize,
     devshot: Option<crate::devshot::DevShot>,
     /// 與 stores 一一對應：是否有未儲存的變更
     dirty: Vec<bool>,
@@ -70,6 +73,8 @@ impl App {
             message: None,
             hs: HandshakeState::default(),
             chain_cache: None,
+            show_tree: false,
+            tree_selected: 0,
             devshot: crate::devshot::DevShot::from_env(),
             dirty: Vec::new(),
             dialog: None,
@@ -174,6 +179,37 @@ impl App {
         self.selected_entry = None;
         self.chain_cache = None;
         self.hs.on_stores_changed(self.stores.len());
+    }
+
+    /// 每張憑證（sha256）出現在哪些「檔案 / 別名」。
+    fn locations(&self) -> crate::graph::Locations {
+        let mut m = crate::graph::Locations::new();
+        for ks in &self.stores {
+            for e in &ks.entries {
+                for (i, c) in e.chain.iter().enumerate() {
+                    let label = if i == 0 {
+                        format!("{} / {}", ks.name(), e.alias)
+                    } else {
+                        format!("{} / {}（鏈第 {i} 層）", ks.name(), e.alias)
+                    };
+                    m.entry(c.sha256.clone()).or_default().push(label);
+                }
+            }
+        }
+        m
+    }
+
+    /// 找出以這張憑證為終端憑證的條目，優先找 `prefer` 檔案。
+    fn find_cert(&self, sha256: &str, prefer: usize) -> Option<(usize, usize)> {
+        let hit = |si: usize| {
+            self.stores.get(si).and_then(|ks| {
+                ks.entries
+                    .iter()
+                    .position(|e| e.leaf().is_some_and(|c| c.sha256 == sha256))
+                    .map(|ei| (si, ei))
+            })
+        };
+        hit(prefer).or_else(|| (0..self.stores.len()).find_map(hit))
     }
 
     fn pool(&self) -> Vec<&CertInfo> {
@@ -409,10 +445,15 @@ impl App {
                     entry: ei,
                     file: ks.name(),
                     alias: e.alias.clone(),
-                    kind: if e.chain.len() > 1 {
-                        format!("{}（鏈 {}）", e.kind, e.chain.len())
-                    } else {
-                        e.kind.to_string()
+                    kind: {
+                        let mut k = e.kind.to_string();
+                        if let Some(c) = leaf {
+                            k = format!("{k} · {}", c.role());
+                        }
+                        if e.chain.len() > 1 {
+                            k = format!("{k}（鏈 {}）", e.chain.len());
+                        }
+                        k
                     },
                     cn: leaf
                         .map(|c| c.display_name())
@@ -464,7 +505,7 @@ impl App {
         }
         table = table
             .column(Column::initial(100.0).clip(true))
-            .column(Column::initial(115.0).clip(true))
+            .column(Column::initial(170.0).clip(true))
             .column(Column::initial(180.0).clip(true))
             .column(Column::initial(150.0).clip(true))
             .column(Column::initial(90.0))
@@ -545,6 +586,7 @@ impl App {
             if self.selected_entry != Some(c) {
                 self.selected_entry = Some(c);
                 self.selected_link = 0;
+                self.tree_selected = usize::MAX;
             }
         }
     }
@@ -568,14 +610,27 @@ impl App {
         }
 
         // 憑證鏈（所有開啟的檔案都作為補齊來源）
-        let need = !matches!(&self.chain_cache, Some((k, _)) if *k == (si, ei));
+        let need = !matches!(&self.chain_cache, Some((k, _, _)) if *k == (si, ei));
         if need {
-            let built = build_chain(&entry.chain, &self.pool(), now_ts(), self.warn_days);
-            self.chain_cache = Some(((si, ei), built));
+            let pool = self.pool();
+            let built = build_chain(&entry.chain, &pool, now_ts(), self.warn_days);
+            let tree = issuance_tree(&built, &pool);
+            self.chain_cache = Some(((si, ei), built, tree));
         }
-        let Some((_, chain)) = &self.chain_cache else {
+        let Some((_, chain, tree)) = &self.chain_cache else {
             return;
         };
+        if self.tree_selected >= tree.nodes.len() {
+            self.tree_selected = tree.nodes.iter().position(|n| n.is_target).unwrap_or(0);
+        }
+        let locations = if self.show_tree {
+            self.locations()
+        } else {
+            Default::default()
+        };
+        let mut show_tree = self.show_tree;
+        let mut tree_click = None;
+        let mut goto = None;
         let entry = &self.stores[si].entries[ei];
         let mut select_link = None;
         let mut copy = None;
@@ -596,10 +651,50 @@ impl App {
                 ui.separator();
                 ui.columns(2, |cols| {
                     // 左：憑證鏈
+                    cols[0].horizontal(|ui| {
+                        ui.selectable_value(&mut show_tree, false, RichText::new("🔗 憑證鏈").strong());
+                        ui.selectable_value(
+                            &mut show_tree,
+                            true,
+                            RichText::new("🌳 簽發關係圖").strong(),
+                        )
+                        .on_hover_text("在所有已開啟的檔案中，找出誰簽發了這張憑證、它又簽發了哪些憑證");
+                    });
+                    if self.show_tree {
+                        egui::ScrollArea::both()
+                            .id_salt("tree")
+                            .auto_shrink([false, false])
+                            .show(&mut cols[0], |ui| {
+                                tree_click = crate::graph::tree_ui(
+                                    ui,
+                                    tree,
+                                    self.tree_selected,
+                                    &locations,
+                                    self.warn_days,
+                                );
+                                ui.add_space(4.0);
+                                if let Some(m) = &tree.missing_issuer {
+                                    ui.colored_label(
+                                        RED,
+                                        format!("✘ 最上層憑證的簽發者不在已開啟的檔案中：{m}"),
+                                    );
+                                }
+                                if tree.truncated {
+                                    ui.colored_label(YELLOW, "⚠ 憑證太多，只顯示前 400 張");
+                                }
+                                let target = tree.nodes.iter().position(|n| n.is_target);
+                                let issued = target.map_or(0, |t| {
+                                    tree.nodes.iter().filter(|n| n.parent == Some(t)).count()
+                                });
+                                if target.is_some_and(|t| tree.nodes[t].cert.is_ca) && issued == 0 {
+                                    ui.weak("已開啟的檔案中沒有由這張 CA 簽發的憑證；可開啟其他憑證庫一起比對");
+                                }
+                                ui.weak("線條：綠＝簽章驗證通過、紅＝失敗、灰＝無法判斷；藍框＝目前憑證到根的路徑");
+                            });
+                    } else {
                     egui::ScrollArea::vertical()
                         .id_salt("chain")
                         .show(&mut cols[0], |ui| {
-                            ui.strong("憑證鏈");
                             for (i, l) in chain.links.iter().enumerate() {
                                 ui.horizontal(|ui| {
                                     ui.add_space(i as f32 * 18.0);
@@ -666,7 +761,42 @@ impl App {
                                 }
                             });
                         });
+                    }
                     // 右：憑證內容
+                    if self.show_tree {
+                        if let Some(n) = tree.nodes.get(self.tree_selected) {
+                            egui::ScrollArea::vertical()
+                                .id_salt("cert")
+                                .show(&mut cols[1], |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.strong(n.cert.display_name());
+                                        let target = self.stores[si].entries[ei]
+                                            .leaf()
+                                            .is_some_and(|c| c.sha256 == n.cert.sha256);
+                                        if !target {
+                                            if let Some(loc) = self.find_cert(&n.cert.sha256, si) {
+                                                if ui
+                                                    .button("➡ 前往此條目")
+                                                    .on_hover_text("在清單中選取這張憑證所在的條目")
+                                                    .clicked()
+                                                {
+                                                    goto = Some(loc);
+                                                }
+                                            }
+                                        }
+                                    });
+                                    if let Some(v) = locations.get(&n.cert.sha256) {
+                                        ui.weak(format!("位置：{}", v.join("、")));
+                                    }
+                                    cert_grid(
+                                        ui,
+                                        "tree_cert_grid",
+                                        &n.cert,
+                                        n.cert.status_at(now_ts(), self.warn_days),
+                                    );
+                                });
+                        }
+                    } else {
                     let idx = self.selected_link.min(chain.links.len().saturating_sub(1));
                     if let Some(l) = chain.links.get(idx) {
                         egui::ScrollArea::vertical()
@@ -676,9 +806,22 @@ impl App {
                                 cert_grid(ui, "cert_grid", &l.cert, l.validity);
                             });
                     }
+                    }
                 });
             });
 
+        self.show_tree = show_tree;
+        if let Some(i) = tree_click {
+            self.tree_selected = i;
+        }
+        if let Some((s, e)) = goto {
+            if self.selected_store.is_some() {
+                self.selected_store = Some(s);
+            }
+            self.selected_entry = Some((s, e));
+            self.selected_link = 0;
+            self.tree_selected = usize::MAX;
+        }
         if let Some(i) = select_link {
             self.selected_link = i;
         }
@@ -1070,6 +1213,10 @@ impl eframe::App for App {
                         .unwrap_or(0);
                     self.selected_entry = Some((0, first));
                     match shot.tab.as_str() {
+                        "tree" => {
+                            self.selected_store = None;
+                            self.show_tree = true;
+                        }
                         "gen" => {
                             let mut g = GenChain::new(0);
                             g.leaf_cn = "api.example.com".into();

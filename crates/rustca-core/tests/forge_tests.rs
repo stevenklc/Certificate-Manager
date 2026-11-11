@@ -252,3 +252,47 @@ fn java_compat_with_local_keytool() {
         }
     }
 }
+
+#[test]
+fn issuance_tree_shows_issuers_and_issued() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, chain) = make_store(&dir.path().join("t.jks"), StoreFormat::Jks);
+    // 另一張由中繼 CA 簽發的憑證
+    let other = forge::issue(
+        &spec("other.example.com", Profile::Server, KeyAlg::EcP256),
+        Some(Signer {
+            cert: &chain[1].cert,
+            key_pkcs8: &chain[1].key_pkcs8,
+        }),
+        None,
+    )
+    .unwrap();
+    let mut pool: Vec<&CertInfo> = ks.all_certs();
+    pool.push(&other.cert);
+
+    // 從終端憑證出發：根 → 中繼 → {svc, other}
+    let built = build_chain(&ks.entry("server").unwrap().chain, &pool, now_ts(), 30);
+    let tree = issuance_tree(&built, &pool);
+    let names: Vec<_> = tree
+        .nodes
+        .iter()
+        .map(|n| (n.depth, n.cert.display_name(), n.is_target, n.on_path))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            (0, "Test Root".to_string(), false, true),
+            (1, "Test Intermediate".to_string(), false, true),
+            (2, "svc.example.com".to_string(), true, true),
+            (2, "other.example.com".to_string(), false, false),
+        ]
+    );
+    assert!(tree.nodes[1..].iter().all(|n| n.signature_ok == Some(true)));
+    assert!(tree.missing_issuer.is_none());
+
+    // 從根憑證出發也能看到它簽發的所有憑證
+    let built = build_chain(&ks.entry("root").unwrap().chain, &pool, now_ts(), 30);
+    let tree = issuance_tree(&built, &pool);
+    assert_eq!(tree.nodes.len(), 4);
+    assert!(tree.nodes[0].is_target);
+}

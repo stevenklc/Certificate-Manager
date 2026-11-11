@@ -4,6 +4,7 @@
 mod app;
 mod devshot;
 mod fonts;
+mod graph;
 mod handshake;
 mod manage;
 mod tools;
