@@ -985,6 +985,151 @@ pub fn parse_header(line: &str) -> std::result::Result<(String, String), String>
     Ok((k.to_string(), v.trim().to_string()))
 }
 
+impl HandshakeReport {
+    /// 以純文字輸出完整結果與過程（供複製、貼到工單或 email）。
+    ///
+    /// 不含 proxy 帳密；敏感的 HTTP 標頭（Authorization、Cookie…）會遮蔽。
+    /// `with_pem` 為 true 時附上憑證鏈的 PEM。
+    pub fn to_text(&self, with_pem: bool) -> String {
+        use std::fmt::Write as _;
+        let now = crate::cert::now_ts();
+        let mut s = String::new();
+        let mode = if self.mode == "local" {
+            "本機模擬"
+        } else {
+            "遠端連線"
+        };
+        let _ = writeln!(s, "═══ TLS 交握（{mode}）═══");
+        let _ = writeln!(s, "時間：{}", crate::cert::format_ts(now));
+        let result = if self.success {
+            "✔ 交握成功".to_string()
+        } else if let Some(f) = &self.failure {
+            format!("✘ 交握失敗（{}偵測到錯誤）", f.side)
+        } else {
+            "✘ 交握失敗".to_string()
+        };
+        let _ = writeln!(s, "結果：{result}");
+        if let Some(f) = &self.failure {
+            let _ = writeln!(s, "錯誤：{}", f.message);
+            if !f.hint.is_empty() {
+                let _ = writeln!(s, "診斷：");
+                for l in f.hint.lines() {
+                    let _ = writeln!(s, "  {l}");
+                }
+            }
+        }
+
+        let _ = writeln!(s, "\n── 連線資訊 ──");
+        let _ = writeln!(s, "目標：{}", self.target);
+        let _ = writeln!(s, "SNI / 驗證名稱：{}", self.server_name);
+        if let Some(p) = &self.via_proxy {
+            let _ = writeln!(s, "經由 Proxy：{p}");
+        }
+        let _ = writeln!(s, "信任錨點數：{}", self.trust_anchor_count);
+        let dash = |o: &Option<String>| o.clone().unwrap_or_else(|| "-".into());
+        let _ = writeln!(s, "協定：{}", dash(&self.protocol));
+        let _ = writeln!(s, "加密套件：{}", dash(&self.cipher_suite));
+        let _ = writeln!(s, "金鑰交換：{}", dash(&self.key_exchange));
+        let _ = writeln!(
+            s,
+            "Server 要求 Client 憑證：{}",
+            if self.client_auth_requested {
+                "是（mTLS）"
+            } else {
+                "否"
+            }
+        );
+        if !self.acceptable_ca_names.is_empty() {
+            let _ = writeln!(s, "Server 可接受的 Client CA：");
+            for n in &self.acceptable_ca_names {
+                let _ = writeln!(s, "  - {n}");
+            }
+        }
+        for w in &self.warnings {
+            let _ = writeln!(s, "⚠ {w}");
+        }
+
+        if !self.transcript.is_empty() {
+            let _ = writeln!(s, "\n── 交握訊息 ──");
+            for l in &self.transcript {
+                let arrow = if l.direction == "C→S" {
+                    "Client ──▶ Server"
+                } else {
+                    "Client ◀── Server"
+                };
+                let _ = writeln!(s, "{arrow}  {}", l.message);
+            }
+        }
+
+        for (title, chain) in [
+            ("Server 送出的憑證鏈", &self.server_chain),
+            ("Client 送出的憑證鏈", &self.client_chain),
+        ] {
+            if chain.is_empty() {
+                continue;
+            }
+            let _ = writeln!(s, "\n── {title} ──");
+            for (i, c) in chain.iter().enumerate() {
+                let _ = writeln!(s, "[{i}] {}  {}", c.display_name(), c.status_at(now, 30).label());
+                let _ = writeln!(s, "    主體：{}", c.subject);
+                let _ = writeln!(s, "    簽發者：{}", c.issuer);
+                let _ = writeln!(
+                    s,
+                    "    有效期間：{} ～ {}",
+                    crate::cert::format_ts(c.not_before),
+                    crate::cert::format_ts(c.not_after)
+                );
+                if !c.subject_alt_names.is_empty() {
+                    let _ = writeln!(s, "    SAN：{}", c.subject_alt_names.join(", "));
+                }
+                let _ = writeln!(s, "    序號：{}", c.serial);
+                let _ = writeln!(s, "    簽章演算法：{}", c.signature_algorithm);
+                let _ = writeln!(s, "    SHA-256：{}", c.sha256);
+            }
+            if with_pem {
+                let _ = writeln!(s);
+                for c in chain.iter() {
+                    s.push_str(&c.to_pem());
+                    if !s.ends_with('\n') {
+                        s.push('\n');
+                    }
+                }
+            }
+        }
+
+        if let Some(h) = &self.http {
+            let _ = writeln!(s, "\n── HTTP 請求 / 回應 ──");
+            let _ = writeln!(s, "> {}", h.request_line);
+            for (k, v) in &h.request_headers {
+                let _ = writeln!(s, "> {k}: {v}");
+            }
+            if let Some(e) = &h.error {
+                let _ = writeln!(s, "✘ {e}");
+            }
+            if !h.status_line.is_empty() {
+                let _ = writeln!(s, "< {}  ({} ms, {} bytes)", h.status_line, h.elapsed_ms, h.body_bytes);
+                for (k, v) in &h.headers {
+                    let v = if k.eq_ignore_ascii_case("set-cookie") {
+                        "***".to_string()
+                    } else {
+                        mask_header(k, v)
+                    };
+                    let _ = writeln!(s, "< {k}: {v}");
+                }
+                let _ = writeln!(s);
+                const MAX_LINES: usize = 40;
+                for l in h.body_preview.lines().take(MAX_LINES) {
+                    let _ = writeln!(s, "{l}");
+                }
+                if h.truncated || h.body_preview.lines().count() > MAX_LINES {
+                    let _ = writeln!(s, "…（共 {} bytes，僅附部分內容）", h.body_bytes);
+                }
+            }
+        }
+        s
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct HttpResponse {
     /// 送出的請求列，例如 "GET /api HTTP/1.1"

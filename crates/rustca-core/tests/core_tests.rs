@@ -274,6 +274,17 @@ fn local_handshake_ok_and_failures() {
         &LocalOptions::default(),
     );
     assert!(!r.success);
+    // 複製用純文字：含結果、診斷、交握過程與憑證鏈
+    let txt = r.to_text(false);
+    assert!(txt.contains("✘ 交握失敗"), "{txt}");
+    assert!(txt.contains("診斷："));
+    assert!(txt.contains("── 交握訊息 ──"));
+    assert!(txt.contains("Client ──▶ Server  ClientHello"));
+    assert!(txt.contains("── Server 送出的憑證鏈 ──"));
+    assert!(txt.contains("SHA-256："));
+    assert!(!txt.contains("BEGIN CERTIFICATE"));
+    let pem = r.to_text(true);
+    assert_eq!(pem.matches("-----BEGIN CERTIFICATE-----").count(), r.server_chain.len());
     assert!(r.failure.unwrap().hint.contains("根 CA"));
 
     // 模擬未來時間 → 過期（rcgen 預設到期日為 4096 年）

@@ -157,6 +157,8 @@ pub struct HandshakeState {
     running: Option<Shared>,
     result: Option<HandshakeReport>,
     error: Option<String>,
+    /// 上次按下複製的時間（顯示「已複製」提示用）
+    copied_at: Option<f64>,
     /// 使用者在此分頁要求開啟的檔案，由 App 取走
     pub open_requests: Vec<PathBuf>,
 }
@@ -188,6 +190,7 @@ impl Default for HandshakeState {
             running: None,
             result: None,
             error: None,
+            copied_at: None,
             open_requests: vec![],
         }
     }
@@ -709,10 +712,44 @@ impl HandshakeState {
                 }
                 ui.separator();
                 if let Some(r) = &self.result {
+                    copy_bar(ui, r, &mut self.copied_at);
                     report_ui(ui, r);
                 }
             });
     }
+}
+
+/// 結果上方的複製列：把結果與過程以純文字複製到剪貼簿。
+fn copy_bar(ui: &mut egui::Ui, r: &HandshakeReport, copied_at: &mut Option<f64>) {
+    let now = ui.input(|i| i.time);
+    ui.horizontal(|ui| {
+        if ui
+            .button("📋 複製結果與過程")
+            .on_hover_text("連線資訊、交握訊息、憑證鏈（含有效期間與 SHA-256）、HTTP 回應，純文字格式")
+            .clicked()
+        {
+            ui.ctx().copy_text(r.to_text(false));
+            *copied_at = Some(now);
+        }
+        let has_chain = !r.server_chain.is_empty() || !r.client_chain.is_empty();
+        if ui
+            .add_enabled(has_chain, egui::Button::new("📋 複製（含憑證 PEM）"))
+            .on_hover_text("同上，另附憑證鏈的 PEM，可直接存成 .pem 匯入或用 openssl 檢查")
+            .clicked()
+        {
+            ui.ctx().copy_text(r.to_text(true));
+            *copied_at = Some(now);
+        }
+        if let Some(t) = *copied_at {
+            if now - t < 2.5 {
+                ui.colored_label(GREEN, "✔ 已複製到剪貼簿");
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            } else {
+                *copied_at = None;
+            }
+        }
+    });
+    ui.add_space(4.0);
 }
 
 fn report_ui(ui: &mut egui::Ui, r: &HandshakeReport) {
