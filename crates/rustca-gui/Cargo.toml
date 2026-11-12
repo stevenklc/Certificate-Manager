@@ -3,7 +3,7 @@ name = "rustca-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RUST-CA 圖形介面（Windows）"
+description = "憑證管理工具 Certificate Manager：圖形介面（Windows）"
 
 [[bin]]
 name = "rust-ca-gui"

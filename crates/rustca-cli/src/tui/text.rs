@@ -222,7 +222,11 @@ pub fn help() -> Vec<Line<'static>> {
         ])
     };
     vec![
-        heading("RUST-CA 終端機介面"),
+        heading(if cfg!(target_os = "linux") {
+            format!("{} - Terminal UI", crate::APP_TITLE)
+        } else {
+            format!("{}：終端機介面", crate::APP_TITLE)
+        }),
         Line::raw("  透過 SSH 即可使用，不需要圖形環境。啟動：rust-ca tui <檔案或目錄…> [-p 密碼]"),
         Line::raw("  開檔時會依序嘗試：-p / RUST_CA_PASSWORD、已輸入過的密碼、changeit；都不對才詢問。"),
         Line::raw(""),

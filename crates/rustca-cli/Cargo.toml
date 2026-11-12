@@ -3,7 +3,7 @@ name = "rustca-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RUST-CA 命令列工具（Windows / Linux）"
+description = "憑證管理工具 Certificate Manager：命令列工具（Windows / Linux）"
 
 [[bin]]
 name = "rust-ca"

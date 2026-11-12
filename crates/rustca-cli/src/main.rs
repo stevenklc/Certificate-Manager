@@ -18,11 +18,24 @@ use rustca_core::{build_chain, now_ts, parse_date, search, CertInfo};
 use crate::output::Out;
 use crate::store::{PasswordArgs, StoreOpener};
 
+/// 程式標題：Linux 只用英文，其他平台中英並列。
+pub(crate) const APP_TITLE: &str = if cfg!(target_os = "linux") {
+    "Certificate Manager"
+} else {
+    "憑證管理工具 Certificate Manager"
+};
+
+const ABOUT: &str = if cfg!(target_os = "linux") {
+    "Certificate Manager: inspect JKS / JCEKS / PKCS#12 / PEM / CER keystores, certificate chains and validity, and simulate TLS handshakes"
+} else {
+    "憑證管理工具 Certificate Manager：查看 JKS / JCEKS / PKCS#12 / PEM / CER 憑證庫、憑證鏈、有效期限，並模擬 TLS 交握"
+};
+
 #[derive(Parser)]
 #[command(
     name = "rust-ca",
     version,
-    about = "查看 JKS / JCEKS / PKCS#12 / PEM / CER 憑證庫、憑證鏈、有效期限，並模擬 TLS 交握",
+    about = ABOUT,
     after_help = "密碼可用 -p 指定、設定環境變數 RUST_CA_PASSWORD，或在提示時輸入（建議，避免留在 shell 歷史）。"
 )]
 struct Cli {

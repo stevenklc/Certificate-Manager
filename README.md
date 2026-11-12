@@ -1,114 +1,108 @@
-# RUST-CA
+# 憑證管理工具 Certificate Manager
 
-用 Rust 寫的憑證庫（keystore）檢視、管理、製作與 TLS 交握模擬工具，分成兩個程式：
+用 Rust 寫的憑證管理工具（專案代號 RUST-CA）：**檢視、搜尋、管理、製作**憑證庫（keystore）與憑證鏈，並能**模擬 TLS 交握**，找出 Client 與 Server 為什麼連不起來。
 
-| 程式 | 平台 | 用途 |
+A certificate & keystore manager written in Rust: view, search, manage and create keystores (JKS / JCEKS / PKCS#12 / PEM / DER) and certificate chains, and simulate TLS handshakes to find out why a client and server can't connect.
+
+| 程式 | 平台 | 適合情境 |
 |---|---|---|
-| `rust-ca`（CLI） | Windows / Linux | 命令列查詢、腳本與排程使用，支援 JSON 輸出 |
-| `rust-ca-gui`（GUI） | Windows | 圖形介面，可拖曳開檔、即時搜尋、點選查看憑證鏈 |
+| `rust-ca` | Windows / Linux | 命令列查詢、腳本與排程，支援 `--json` 輸出 |
+| `rust-ca tui` | Windows / Linux | 終端機互動介面（仿 k9s），透過 SSH 就能在伺服器上使用，不需要圖形環境 |
+| `rust-ca-gui` | Windows | 圖形介面：拖曳開檔、即時搜尋、簽發關係圖、交握模擬 |
+
+## 目錄
+
+- [功能](#功能)
+- [快速開始](#快速開始)
+- [CLI 使用方式](#cli-使用方式)
+- [TUI 使用方式](#tui-使用方式)
+- [GUI 使用方式](#gui-使用方式)
+- [建置](#建置)
+- [測試](#測試)
+- [專案結構](#專案結構)
+- [已知限制](#已知限制)
+- [授權](#授權)
 
 ## 功能
 
-- **讀取格式**：JKS、JCEKS、PKCS#12（.p12/.pfx）、PEM、DER（.cer/.crt）、PKCS#7（.p7b）
-  - JKS / JCEKS 會驗證完整性，並解密私鑰（Sun KeyProtector 與 PBEWithMD5AndTripleDES）
+### 檢視與搜尋
+
+- **支援格式**：JKS、JCEKS、PKCS#12（.p12 / .pfx）、PEM、DER（.cer / .crt）、PKCS#7（.p7b）
+  - JKS / JCEKS 會驗證完整性並解密私鑰（Sun KeyProtector、PBEWithMD5AndTripleDES）
   - 沒有密碼也能列出憑證，只是不驗證完整性、不解密私鑰
-- **終端機介面（TUI）**：`rust-ca tui`，操作方式仿 k9s，透過 SSH（例如 MobaXterm）就能在 Linux 主機上使用，不需要 X11 或圖形環境；可瀏覽、篩選、跨檔搜尋、查看憑證鏈、到期檢查與遠端交握
-- **有效期限**：顯示生效日、到期日、剩餘天數；可設定「幾天內到期」的提醒門檻
-- **憑證鏈**：從終端憑證經中繼憑證一路組到根憑證，逐層驗證簽章，並檢查鏈是否完整、有沒有過期、CA 旗標是否正確；也可以拿其他檔案來補齊缺少的 CA
-- **簽發關係圖**（GUI）：選取任一憑證，畫出「誰簽發了它、它又簽發了哪些憑證」的樹狀圖，範圍涵蓋所有已開啟的檔案；連線顏色代表簽章驗證結果，點方框可看憑證內容或跳到所在條目；工具列的「🌳 簽發關係圖」以大畫面開啟，可切換只看目前條目或整個憑證庫（也可包含所有已開啟的檔案）
-- **憑證角色**：類型欄除了條目種類（私鑰條目 / 信任憑證），也標出憑證本身是根 CA、中繼 CA、終端或自簽
-- **關鍵字搜尋**：比對別名、主體、簽發者、SAN、序號、SHA-1／SHA-256 指紋、金鑰用途；不分大小寫，序號和指紋可省略冒號
-- **TLS 交握模擬**
-  - **本機模擬**：用兩組憑證庫分別扮演 Server 與 Client，在記憶體中完成交握，不需要開任何連接埠
-  - **遠端連線**：以 Client 身分連到真實 Server，取得對方送出的憑證鏈
-  - 支援 mTLS（雙向 TLS），也能顯示 Server 可接受哪些 Client CA
-  - 可指定 TLS 1.2／1.3、SNI，以及「模擬時間」（例如檢查憑證到期後還能不能交握）
-  - 逐筆列出交握訊息（ClientHello、Certificate、Alert…）
-  - 失敗時以中文說明原因與建議，例如缺根 CA、主機名稱不符 SAN、EKU 不符、Client 憑證不被信任、企業 proxy 進行 TLS 檢查
-  - 支援 HTTP CONNECT proxy（含帳密），自動讀取 `HTTPS_PROXY` / `NO_PROXY` 與 Windows 系統 proxy 設定
-  - 經由 proxy 時，若收到的憑證鏈連不到公開根憑證（Mozilla 清單），會醒目標示「這不是 Server 的真實憑證鏈」：企業 proxy 的 TLS 檢查會以自家 CA 重新簽發憑證，這時的結果只代表「這台電腦經由這個 proxy」，要判斷其他主機的信任庫請在該主機上執行 Linux 版 CLI
-  - 交握結果可複製成純文字（結果、診斷、交握訊息、憑證鏈，可附 PEM），proxy 帳密與敏感標頭會遮蔽
-  - 遠端目標可以是網域（`host:port`），也可以是 API 網址（`https://host/api/...`）；交握成功後可送出 HTTP 請求（方法、標頭、Body），顯示狀態碼、回應標頭與內容，`Authorization`、Cookie 等敏感標頭會遮蔽
-  - Client / Server 身分可以用憑證庫（.jks / .p12），也可以用「憑證檔 + 私鑰檔」（.cer / .crt / .pem + .key）
-- **憑證庫管理**（JKS、JCEKS、PKCS#12）
-  - 匯入信任憑證、匯入金鑰對（來自另一個憑證庫，或憑證 + 私鑰檔）、刪除、修改別名
-  - 同一別名替換憑證 / 憑證鏈（續約、CA 回覆），**替換後自動驗證**：私鑰相符、鏈的順序與簽章、CA 屬性、有效期限、能否連到根憑證；驗證失敗不會套用
-  - 修改憑證庫密碼（store pass）與各條目的私鑰密碼（key pass）；不同條目私鑰密碼不同也能處理
-  - 儲存前自動備份（`檔名.YYYYMMDD-HHMMSS.bak`），先寫暫存檔再改名，避免寫到一半損毀
-  - 寫出的檔案經 Java keytool 驗證可正常讀取
-- **格式轉換**
-  - 憑證庫：JKS ⇄ JCEKS ⇄ PKCS#12，也能把 PEM 憑證 + 私鑰轉成憑證庫；PKCS#12 可選「舊版相容」演算法（3DES + HmacSHA1）給舊版 Java
-  - 憑證：PEM ⇄ DER（.cer）⇄ PKCS#7（.p7b），可從憑證庫取出憑證鏈或私鑰
-- **製作憑證庫與憑證鏈**
-  - 建立新的空白憑證庫，或**由多個現成的 cer / key 檔組成憑證庫**：一次選取多個 .cer / .crt / .pem / .key / .p7b / .p12，自動用公鑰配對私鑰與憑證、用一起選取的 CA 憑證補齊憑證鏈，其餘 CA 成為信任憑證；建立前可預覽、調整別名、取消勾選（既有憑證庫也可用「📥 批次匯入」）
-  - 一次產生「根 CA → 中繼 CA（可多層）→ Server / Client 憑證」，金鑰可選 RSA 2048/3072/4096、EC P-256/P-384，可設定 SAN、有效天數、O / OU / C
-  - 可保存 CA 私鑰，之後再用憑證庫中的 CA 簽發新的憑證
-- **Java 相容性測試**：自動找出本機安裝的各版本 JDK / JRE（JAVA_HOME、PATH、常見安裝目錄、`~/.jdks`，也可手動加入目錄），用每個版本的 keytool 實際讀取憑證庫並解開每把私鑰，並提示已知的版本限制（例如 PKCS#12 AES 需 Java 8u301+、EdDSA 需 Java 15+）
-- **用途檢查**：選擇要當作 Server keystore、Client keystore（mTLS）或 Truststore，檢查是否適合——私鑰與憑證鏈、serverAuth / clientAuth 用途、Key Usage、SAN 是否涵蓋主機名稱、弱演算法；Truststore 則檢查是否只放 CA、有無過期、是否混入私鑰或終端憑證。GUI 左側也會標示每個檔案是 Keystore、Truststore 或兩者都有
+- **有效期限**：生效日、到期日、剩餘天數，可設定「幾天內到期」的提醒門檻
+- **憑證鏈**：從終端憑證經中繼憑證組到根憑證，逐層驗證簽章，檢查鏈是否完整、是否過期、CA 旗標是否正確；可拿其他檔案補齊缺少的 CA
+- **憑證角色**：除了條目種類（私鑰條目 / 信任憑證），也標出根 CA、中繼 CA、終端或自簽
+- **簽發關係圖**（GUI）：畫出「誰簽發了它、它又簽發了誰」的樹狀圖，範圍涵蓋所有已開啟的檔案，連線顏色代表簽章驗證結果
+- **關鍵字搜尋**：比對別名、主體、簽發者、SAN、序號、SHA-1 / SHA-256 指紋、金鑰用途；不分大小寫，序號和指紋可省略冒號
 
-## 建置
+### TLS 交握模擬
 
-需要 Rust 工具鏈（[rustup](https://rustup.rs/)）。Windows 建議使用 MSVC toolchain（需安裝 Visual Studio Build Tools 的「使用 C++ 的桌面開發」）。
+- **本機模擬**：用兩組憑證庫分別扮演 Server 與 Client，在記憶體中完成交握，不必開連接埠
+- **遠端連線**：以 Client 身分連到真實 Server，取得對方送出的憑證鏈；目標可以是 `host:port` 或 API 網址（`https://host/api/...`），交握成功後可送出 HTTP 請求並顯示回應
+- 支援 mTLS（雙向 TLS），可顯示 Server 接受哪些 Client CA
+- 可指定 TLS 1.2 / 1.3、SNI，以及「模擬時間」（例如檢查憑證到期後還能不能交握）
+- 逐筆列出交握訊息（ClientHello、Certificate、Alert…）
+- **失敗時用中文說明原因與建議**：缺根 CA、主機名稱不符 SAN、EKU 不符、Client 憑證不被信任、企業 proxy 進行 TLS 檢查…
+- 身分可用憑證庫（.jks / .p12），也可用「憑證檔 + 私鑰檔」（.cer / .crt / .pem + .key）
+- **Proxy**：支援 HTTP CONNECT（含帳密），自動讀取 `HTTPS_PROXY` / `NO_PROXY` 與 Windows 系統 proxy 設定
+  - 經由 proxy 時，若收到的憑證鏈連不到公開根憑證（Mozilla 清單），會醒目標示「**這不是 Server 的真實憑證鏈**」。企業 proxy 的 TLS 檢查會用自家 CA 重新簽發憑證，這時的結果只代表「這台電腦經由這個 proxy」；要判斷其他主機的信任庫，請在該主機上執行 Linux 版 CLI
+- 結果可複製或存成純文字（可附 PEM），proxy 帳密、`Authorization`、Cookie 等敏感資訊會遮蔽
 
-```powershell
-# Windows：CLI + GUI
-cargo build --release
-# 產出：target\release\rust-ca.exe、target\release\rust-ca-gui.exe
-```
+### 憑證庫管理（JKS、JCEKS、PKCS#12）
+
+- 匯入信任憑證、匯入金鑰對（來自另一個憑證庫，或憑證 + 私鑰檔）、刪除、改別名
+- 替換憑證 / 憑證鏈（續約、CA 回覆）後**自動驗證**：私鑰相符、鏈的順序與簽章、CA 屬性、有效期限、能否連到根憑證；驗證失敗就不套用
+- 修改憑證庫密碼（store pass）與各條目的私鑰密碼（key pass），各條目密碼不同也能處理
+- **用途檢查**：檢查是否適合當 Server keystore、Client keystore（mTLS）或 Truststore——私鑰與憑證鏈、serverAuth / clientAuth、Key Usage、SAN 是否涵蓋主機名稱、弱演算法；Truststore 則檢查是否只放 CA、有無過期、是否混入私鑰或終端憑證
+- 儲存前自動備份（`檔名.YYYYMMDD-HHMMSS.bak`），先寫暫存檔再改名，避免寫到一半損毀；寫出的檔案經 Java keytool 驗證可正常讀取
+
+### 格式轉換與製作
+
+- **憑證庫轉換**：JKS ⇄ JCEKS ⇄ PKCS#12，PEM 憑證 + 私鑰 → 憑證庫；PKCS#12 可選「舊版相容」演算法（3DES + HmacSHA1）給舊版 Java
+- **憑證轉換**：PEM ⇄ DER（.cer）⇄ PKCS#7（.p7b），可從憑證庫取出憑證鏈或私鑰
+- **組成憑證庫**：一次選取多個 .cer / .crt / .pem / .key / .p7b / .p12，自動用公鑰配對私鑰與憑證、補齊憑證鏈，其餘 CA 成為信任憑證；建立前可預覽、調整
+- **製作憑證鏈**：一次產生「根 CA → 中繼 CA（可多層）→ Server / Client 憑證」，金鑰可選 RSA 2048 / 3072 / 4096、EC P-256 / P-384，可設定 SAN、有效天數、O / OU / C；可保存 CA 私鑰，之後再用它簽發新憑證
+- **Java 相容性測試**：自動找出本機各版本 JDK / JRE（`JAVA_HOME`、`PATH`、常見安裝目錄、`~/.jdks`，也可手動加入），用每個版本的 keytool 實際讀取憑證庫並解開私鑰，並提示已知的版本限制（例如 PKCS#12 AES 需 Java 8u301+、EdDSA 需 Java 15+）
+
+## 快速開始
 
 ```bash
-# Linux：只建 CLI
-cargo build --release -p rustca-cli
-# 產出：target/release/rust-ca
-```
+cargo build --release              # Windows 產出 rust-ca.exe、rust-ca-gui.exe；Linux 請見「建置」
 
-> GUI 以 Windows 為目標。在 Linux 上也能編譯（X11 / Wayland），方便開發時檢查。
-
-### 在 Linux / WSL 交叉編譯 Windows 版（不需要 Visual Studio、不需要管理員權限）
-
-```bash
-# 一次性準備：下載 llvm-mingw 解壓到 ~/.local/opt，並加入 Rust 的 Windows 目標
-mkdir -p ~/.local/opt && cd ~/.local/opt
-curl -sSfL https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64.tar.xz | tar xJ
-rustup target add x86_64-pc-windows-gnullvm
-
-# 編譯，產出 dist/windows/rust-ca.exe、rust-ca-gui.exe
-scripts/build-windows.sh
-```
-
-產出的 exe 只依賴 Windows 10 以上內建的系統 DLL（含 UCRT），複製過去就能執行。
-
-### Linux 靜態執行檔（Oracle Linux / RHEL 7、8、9）
-
-一般在新版 Linux（例如 Ubuntu 24.04，glibc 2.39）編出來的執行檔，無法在 glibc 比較舊的主機上執行。改用 musl 靜態連結，產出的 `rust-ca` 不依賴任何系統函式庫，複製過去就能用（含 TUI）：
-
-```bash
-rustup target add x86_64-unknown-linux-musl   # 一次性準備；C 編譯器用系統的 gcc 即可
-scripts/build-linux.sh                        # 產出 dist/linux/rust-ca
+rust-ca list server.jks            # 列出條目與到期狀態
+rust-ca chain server.jks           # 分析憑證鏈
+rust-ca handshake remote www.example.com   # 連線遠端，看對方的憑證鏈
+rust-ca tui server.jks             # 終端機互動介面
 ```
 
 ## CLI 使用方式
 
-密碼可以用 `-p` 指定、設定環境變數 `RUST_CA_PASSWORD`，或等程式提示時再輸入。建議用提示輸入，避免密碼留在 shell 歷史紀錄裡。
+### 密碼
+
+- 用 `-p` 指定、設定環境變數 `RUST_CA_PASSWORD`，或等程式提示時再輸入。**建議用提示輸入**，避免密碼留在 shell 歷史紀錄。
+- `handshake local` 的各個憑證庫可分別用 `--server-password`、`--client-password`、`--client-trust-password`、`--server-trust-password` 指定（也有對應的環境變數，例如 `RUST_CA_SERVER_PASSWORD`）。
+- 管理指令的新密碼可用 `--new-password` 或 `RUST_CA_NEW_PASSWORD`，未指定時會提示輸入兩次。
+
+### 檢視、搜尋、到期檢查
 
 ```bash
-# 列出條目與到期狀態（可一次多個檔案）
-rust-ca list server.jks client.p12
+rust-ca list server.jks client.p12             # 可一次多個檔案
+rust-ca show server.jks -a server --pem        # 憑證詳細資訊，--pem 一併輸出 PEM
+rust-ca chain server.pem -t truststore.jks -t inter.pem   # -t 指定 CA 檔案補齊
 
-# 顯示憑證詳細資訊（--pem 一併輸出 PEM）
-rust-ca show server.jks -a server --pem
-
-# 分析憑證鏈，用 -t 指定 CA 檔案補齊
-rust-ca chain server.pem -t truststore.jks -t inter.pem
-
-# 搜尋關鍵字
 rust-ca search "Intermediate" *.jks *.p12
-rust-ca search 2072DB43 server.jks        # 序號 / 指紋可省略冒號
+rust-ca search 2072DB43 server.jks             # 序號 / 指紋可省略冒號
 
-# 到期檢查：有過期回傳 2、即將到期回傳 1，適合排程
-rust-ca expiry *.jks --days 60
+rust-ca expiry *.jks --days 60                 # 有過期回傳 2、即將到期回傳 1，適合排程
 
-# 本機模擬交握
+rust-ca --json list server.jks                 # 所有指令都支援 --json
+```
+
+### 交握模擬
+
+```bash
+# 本機模擬
 rust-ca handshake local --server server.jks --client-trust truststore.jks
 rust-ca handshake local --server server.jks --client-trust truststore.jks \
     --mtls --client client.p12 --server-trust truststore.jks          # 雙向 TLS
@@ -126,27 +120,26 @@ rust-ca handshake remote https://api.internal:8443/health -t truststore.jks
 rust-ca handshake remote https://api.internal/v1/orders -t ca.pem \
     --client-cert client.crt --client-key client.key \
     -X POST -H "Authorization: Bearer xxx" -H "Content-Type: application/json" -d '{"id":1}'
-
-# 所有指令都支援 --json
-rust-ca --json list server.jks
 ```
 
 ### 憑證庫管理（`rust-ca manage`，簡寫 `m`）
 
-修改類指令預設寫回原檔並建立 `.bak` 備份；加 `-o 新檔` 另存（格式依副檔名），`--no-backup` 不備份。新密碼可用 `--new-password` 或環境變數 `RUST_CA_NEW_PASSWORD`，未指定時會提示輸入兩次。
+修改類指令預設寫回原檔並建立 `.bak` 備份；加 `-o 新檔` 另存（格式依副檔名），`--no-backup` 不備份。
 
 ```bash
 # 匯入 / 刪除 / 改名
 rust-ca manage import-cert truststore.jks -f partner-ca.cer -a partner-ca --create
 rust-ca manage import-key server.jks --cert server.crt --key server.key -a server
 rust-ca manage import-key server.jks --from old.p12 --from-alias 1 -a server
+rust-ca manage delete server.jks -a old-server
+rust-ca manage rename server.jks -a server -n server-2026
+
+# 由多個 cer + key 組成憑證庫（自動配對、補齊憑證鏈；--dry-run 只看規劃結果）
+rust-ca manage assemble servers.jks certs/*.crt certs/*.key ca/*.cer --create
+
 # 用途檢查（--as server|client|trust，不指定則依內容判斷；不適合時回傳 2）
 rust-ca manage check-role server.jks --as server --host api.example.com
 rust-ca manage check-role truststore.jks --as trust
-# 由多個 cer + key 組成憑證庫（自動配對、補齊憑證鏈；--dry-run 只看規劃結果）
-rust-ca manage assemble servers.jks certs/*.crt certs/*.key ca/*.cer --create
-rust-ca manage delete server.jks -a old-server
-rust-ca manage rename server.jks -a server -n server-2026
 
 # 替換憑證鏈（續約 / CA 回覆）：替換後自動驗證，失敗不寫入
 rust-ca manage replace-chain server.jks -a server -f renewed-chain.p7b
@@ -158,10 +151,10 @@ rust-ca manage passwd server.jks --keep-key-passwords # 同 keytool -storepasswd
 rust-ca manage keypasswd server.jks -a server        # key pass
 
 # 格式轉換
-rust-ca manage convert server.jks -o server.p12                 # 憑證庫格式
+rust-ca manage convert server.jks -o server.p12                  # 憑證庫格式
 rust-ca manage convert server.jks -o server-old.p12 --legacy-p12 # 給舊版 Java
-rust-ca manage convert server.pem -o server.jks                 # PEM 憑證 + 私鑰 → JKS
-rust-ca manage convert-cert server.jks -a server -o chain.p7b   # 憑證格式
+rust-ca manage convert server.pem -o server.jks                  # PEM 憑證 + 私鑰 → JKS
+rust-ca manage convert-cert server.jks -a server -o chain.p7b    # 憑證格式
 rust-ca manage convert-cert chain.p7b -o chain.pem
 rust-ca manage convert-cert chain.pem -o leaf.cer                # DER（單張）
 
@@ -174,18 +167,18 @@ rust-ca manage gen-chain app.p12 --create --cn client01 --profile client --key e
 rust-ca manage java-test server.jks --java "C:\jdks"
 ```
 
-`handshake local` 的各個憑證庫可以分別用 `--server-password`、`--client-password`、`--client-trust-password`、`--server-trust-password` 指定密碼（也有對應的環境變數，例如 `RUST_CA_SERVER_PASSWORD`）。
-
 ### 結束代碼
 
 | 代碼 | 意義 |
 |---|---|
 | 0 | 成功 |
 | 1 | 交握失敗、憑證鏈不完整、搜尋無結果、有憑證即將到期 |
-| 2 | 有憑證已過期（`expiry`） |
+| 2 | 有憑證已過期（`expiry`）、用途不適合（`check-role`） |
 | 10 | 執行錯誤（檔案不存在、密碼錯誤…） |
 
-## TUI 使用方式（終端機介面）
+## TUI 使用方式
+
+透過 SSH（例如 MobaXterm）就能在 Linux 主機上使用，不需要 X11 或圖形環境。
 
 ```bash
 rust-ca tui /opt/app/conf/server.jks /usr/lib/jvm/java/lib/security/cacerts
@@ -193,22 +186,85 @@ rust-ca tui /opt/app/conf/          # 目錄：開啟第一層的憑證庫檔案
 rust-ca tui                         # 先進入介面，再按 o 開檔（Tab 補齊路徑）
 ```
 
-- 開檔時會依序嘗試 `-p` / `RUST_CA_PASSWORD`、已輸入過的密碼、`changeit`，都不對才詢問；也可以略過，只看憑證、不驗證完整性。
-- 主畫面左側是已開啟的檔案，右側是條目，下方是選取條目的摘要。常用按鍵：
-  `Enter` 詳細資料（憑證鏈分析、全部欄位、`p` 顯示 PEM、`w` 存檔）、`/` 篩選、`s` 搜尋全部檔案、`e` 到期檢查、`h` TLS 交握、`o` 開檔、`t` 依到期日排序、`?` 說明、`q` 離開。
-- 交握頁可選信任庫（作業系統憑證庫、Mozilla 根憑證，或已開啟的檔案如 cacerts）、Client 身分、Proxy（留空自動偵測，`none` 直連）、SNI、TLS 版本；結果可用 `w` 存成文字檔（`W` 另附憑證 PEM）。
-- 介面不攔截滑鼠，可以直接用終端機選取文字複製。
-- 需要 UTF-8 終端機；MobaXterm 預設即可正確顯示中文。
+- 開檔時依序嘗試 `-p` / `RUST_CA_PASSWORD`、已輸入過的密碼、`changeit`，都不對才詢問；也可以略過，只看憑證、不驗證完整性。
+- 畫面左側是已開啟的檔案，右側是條目，下方是選取條目的摘要。
+- 交握頁可選信任庫（作業系統憑證庫、Mozilla 根憑證，或已開啟的檔案如 cacerts）、Client 身分、Proxy（留空自動偵測，`none` 直連）、SNI、TLS 版本。
+- 介面不攔截滑鼠，可直接用終端機選取文字複製；需要 UTF-8 終端機（MobaXterm 預設即可正確顯示中文）。
+
+| 按鍵 | 功能 |
+|---|---|
+| `Enter` | 詳細資料（憑證鏈分析、全部欄位；`p` 顯示 PEM、`w` 存檔） |
+| `/` | 篩選目前清單 |
+| `s` | 搜尋全部檔案 |
+| `e` | 到期檢查 |
+| `h` | TLS 交握（結果按 `w` 存成文字檔，`W` 另附憑證 PEM） |
+| `o` | 開檔 |
+| `t` | 依到期日排序 |
+| `?` | 說明 |
+| `q` | 離開 |
 
 ## GUI 使用方式
 
-1. 執行 `rust-ca-gui.exe`，把檔案拖進視窗，或按「📂 開啟檔案…」。需要密碼時會跳出輸入框。
-2. **憑證庫**分頁：左側是已開啟的檔案，中間是條目表格，上方搜尋框可以即時篩選（選「全部檔案」就跨所有檔案搜尋）；點欄位標題可排序（升冪 ▲ → 降冪 ▼ → 原始順序），「狀態」依已過期 → 即將到期 → 尚未生效 → 有效排列。點選條目後，下方會顯示憑證鏈和憑證內容，也可以複製 PEM。
-3. **管理**：選取檔案或條目後，表格上方會出現管理工具列——匯入憑證、匯入金鑰對、改憑證庫密碼、儲存、另存新檔 / 轉換、製作憑證鏈、Java 相容性測試；選取條目時另有改名、替換憑證鏈、改私鑰密碼、驗證私鑰密碼、驗證憑證鏈、匯出、刪除。這些條目動作也可以在表格列、下方憑證鏈或簽發關係圖的方框上**按右鍵**執行。修改後檔案旁會顯示「● 未儲存」，關閉前會提醒。
-   - 下方憑證鏈中，點選其他層的憑證會跳到該憑證所在的條目（清單自動捲動過去）；簽發關係圖則是點兩下跳轉。
-   - 「驗證私鑰密碼」只檢查 key pass 是否正確，不會修改憑證庫；私鑰尚未解密時，密碼正確就會順便解開。
-4. **🆕 新增憑證庫**、**🔁 轉換憑證格式**：在上方工具列。右上角的「❓ 說明」有名詞解釋（Keystore / Truststore、Client / Server、clientAuth / serverAuth、SAN…）與功能介紹，可搜尋。
-5. **交握模擬**分頁：從已開啟的檔案中挑選 Server／Client 身分（憑證庫，或憑證檔 + 私鑰檔）和信任庫，按「▶ 開始交握」；每個欄位旁的「📂 加入檔案…」可直接開檔。遠端模式可輸入網域或 API 網址，並設定 HTTP 方法、標頭與 Body。
+1. 執行 `rust-ca-gui.exe`，把檔案拖進視窗，或按「📂 開啟檔案…」，需要密碼時會跳出輸入框。
+2. **憑證庫分頁**
+   - 左側是已開啟的檔案（標示 Keystore、Truststore 或兩者），中間是條目表格，上方搜尋框即時篩選（選「全部檔案」可跨檔搜尋）。
+   - 點欄位標題排序（升冪 ▲ → 降冪 ▼ → 原始順序），「狀態」依已過期 → 即將到期 → 尚未生效 → 有效排列。
+   - 點選條目後，下方顯示憑證鏈和憑證內容，可複製 PEM；點選其他層的憑證會跳到該憑證所在的條目。
+   - 工具列的「🌳 簽發關係圖」以大畫面開啟，可切換只看目前條目或整個憑證庫（也可包含所有已開啟的檔案）；點兩下方框跳到該條目。
+3. **管理**：選取檔案或條目後，表格上方會出現管理工具列。
+   - 檔案：匯入憑證、匯入金鑰對、📥 批次匯入、改憑證庫密碼、儲存、另存新檔 / 轉換、製作憑證鏈、Java 相容性測試
+   - 條目：改名、替換憑證鏈、改私鑰密碼、驗證私鑰密碼、驗證憑證鏈、匯出、刪除；也可在表格列、憑證鏈或簽發關係圖的方框上**按右鍵**執行
+   - 「驗證私鑰密碼」只檢查 key pass 是否正確，不會修改憑證庫
+   - 修改後檔案旁會顯示「● 未儲存」，關閉前會提醒
+4. **上方工具列**：🆕 新增憑證庫、🔁 轉換憑證格式；右上角「❓ 說明」有名詞解釋（Keystore / Truststore、Client / Server、clientAuth / serverAuth、SAN…）與功能介紹，可搜尋。
+5. **交握模擬分頁**：從已開啟的檔案挑選 Server / Client 身分與信任庫，按「▶ 開始交握」；每個欄位旁的「📂 加入檔案…」可直接開檔。遠端模式可輸入網域或 API 網址，並設定 HTTP 方法、標頭與 Body。
+
+## 建置
+
+需要 Rust 工具鏈（[rustup](https://rustup.rs/)）。
+
+### Windows（CLI + GUI）
+
+建議使用 MSVC toolchain（需安裝 Visual Studio Build Tools 的「使用 C++ 的桌面開發」）。
+
+```powershell
+cargo build --release
+# 產出：target\release\rust-ca.exe、target\release\rust-ca-gui.exe
+```
+
+### Linux（CLI + TUI）
+
+```bash
+cargo build --release -p rustca-cli
+# 產出：target/release/rust-ca
+```
+
+> GUI 以 Windows 為目標，在 Linux 上也能編譯（X11 / Wayland），方便開發時檢查。
+
+### Linux 靜態執行檔（Oracle Linux / RHEL 7、8、9）
+
+在新版 Linux（例如 Ubuntu 24.04，glibc 2.39）編出來的執行檔，無法在 glibc 較舊的主機上執行。改用 musl 靜態連結，產出的 `rust-ca` 不依賴任何系統函式庫，複製過去就能用（含 TUI）：
+
+```bash
+rustup target add x86_64-unknown-linux-musl   # 一次性準備；C 編譯器用系統的 gcc 即可
+scripts/build-linux.sh                        # 產出 dist/linux/rust-ca
+```
+
+### 在 Linux / WSL 交叉編譯 Windows 版
+
+不需要 Visual Studio，也不需要管理員權限。
+
+```bash
+# 一次性準備：下載 llvm-mingw 解壓到 ~/.local/opt，並加入 Rust 的 Windows 目標
+mkdir -p ~/.local/opt && cd ~/.local/opt
+curl -sSfL https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64.tar.xz | tar xJ
+rustup target add x86_64-pc-windows-gnullvm
+
+# 編譯，產出 dist/windows/rust-ca.exe、rust-ca-gui.exe
+scripts/build-windows.sh
+```
+
+產出的 exe 只依賴 Windows 10 以上內建的系統 DLL（含 UCRT），複製過去就能執行。
 
 ## 測試
 
@@ -216,24 +272,25 @@ rust-ca tui                         # 先進入介面，再按 o 開檔（Tab �
 cargo test --workspace
 ```
 
-測試會用 rcgen 產生憑證，涵蓋 JKS 讀寫、憑證鏈、搜尋，以及本機／遠端／proxy 交握的成功與失敗情境。若系統有 Java `keytool`，還會額外用 keytool 產生 JKS、JCEKS、PKCS#12 來驗證解析器。
+測試用 rcgen 產生憑證，涵蓋 JKS 讀寫、憑證鏈、搜尋，以及本機 / 遠端 / proxy 交握的成功與失敗情境。若系統有 Java `keytool`，還會額外用 keytool 產生 JKS、JCEKS、PKCS#12 驗證解析器。
 
-如果想產生一組示範用 PKI（Root → Intermediate → Server / Client，另含一張過期憑證）來手動試用：
+想產生一組示範用 PKI（Root → Intermediate → Server / Client，另含一張過期憑證）手動試用：
 
 ```bash
 scripts/gen-test-fixtures.sh            # Linux / WSL
 ```
+
 ```powershell
-.\scripts\gen-test-fixtures.ps1          # Windows
+.\scripts\gen-test-fixtures.ps1          # Windows（需要 JDK 的 keytool）
 ```
 
-產出的檔案在 `testdata/`，已列入 `.gitignore`。
+產出的檔案在 `testdata/`，已列入 `.gitignore`，密碼為 `changeit`（僅供測試）。
 
 ## 專案結構
 
 ```
 crates/
-  rustca-core/   核心函式庫：格式解析、憑證資訊、憑證鏈、搜尋、TLS 模擬
+  rustca-core/   核心函式庫：格式解析、憑證資訊、憑證鏈、搜尋、管理、TLS 模擬
   rustca-cli/    命令列工具 rust-ca（含 TUI：src/tui/，使用 ratatui）
   rustca-gui/    圖形介面 rust-ca-gui（eframe / egui）
 scripts/         建置腳本（Windows 交叉編譯、Linux 靜態執行檔）與產生測試用憑證庫的腳本
@@ -241,13 +298,13 @@ scripts/         建置腳本（Windows 交叉編譯、Linux 靜態執行檔）�
 
 ## 已知限制
 
-- JCEKS 的秘密金鑰（SecretKey）條目是 Java 序列化物件，遇到時只會顯示該條目，後面的條目無法繼續解析
+- JCEKS 的秘密金鑰（SecretKey）條目是 Java 序列化物件，遇到時只會顯示該條目，後面的條目無法繼續解析；含 SecretKey 條目的 JCEKS 無法寫回
 - PEM 加密私鑰（`ENCRYPTED PRIVATE KEY`）尚不支援，請先用 openssl 解密
-- 寫入 JKS / JCEKS 時別名會轉成小寫（與 keytool 相同）；含 SecretKey 條目的 JCEKS 無法寫回
+- 寫入 JKS / JCEKS 時別名會轉成小寫（與 keytool 相同）
 - 用既有 CA 簽發時，CA 主體不可含重複的屬性型別（例如兩個 OU）
-- Java 相容性測試需要本機已安裝 Java；只會測試找得到的版本
-- TLS 模擬使用 rustls，只支援 TLS 1.2／1.3。它比 Java／OpenSSL 嚴格，例如不接受 SHA-1 簽章，也不接受 Java 8 keytool 產生的帶 NULL 參數的 ECDSA 憑證。遇到這類情況，診斷訊息會特別說明
-- proxy 只支援 HTTP CONNECT（Basic 認證），不支援 NTLM / Kerberos。沒有指定 `--proxy` 時，會依序使用 `HTTPS_PROXY` / `NO_PROXY`、Windows 系統 proxy 設定（含 ProxyOverride 例外清單）
+- Java 相容性測試需要本機已安裝 Java，只會測試找得到的版本
+- TLS 模擬使用 rustls，只支援 TLS 1.2 / 1.3。它比 Java / OpenSSL 嚴格，例如不接受 SHA-1 簽章，也不接受 Java 8 keytool 產生的帶 NULL 參數的 ECDSA 憑證；遇到這類情況，診斷訊息會特別說明
+- Proxy 只支援 HTTP CONNECT（Basic 認證），不支援 NTLM / Kerberos。沒有指定 `--proxy` 時，依序使用 `HTTPS_PROXY` / `NO_PROXY`、Windows 系統 proxy 設定（含 ProxyOverride 例外清單）
 
 ## 授權
 
