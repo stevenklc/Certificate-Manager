@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "rustca-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "rustca-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3821,7 +3821,7 @@ dependencies = [
 
 [[package]]
 name = "rustca-gui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "eframe",
